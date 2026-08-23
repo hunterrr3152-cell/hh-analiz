@@ -83,7 +83,7 @@ async def parse_image_with_gemini(image_bytes: bytes) -> Dict[str, Any]:
             try:
                 response = await asyncio.to_thread(
                     client.models.generate_content,
-                    model='gemini-3.5-flash',
+                    model='gemini-2.5-flash-lite',
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                         PROMPT_DEKONT
@@ -95,8 +95,12 @@ async def parse_image_with_gemini(image_bytes: bytes) -> Dict[str, Any]:
                     )
                 )
                 return json.loads(response.text)
-            except Exception:
-                await asyncio.sleep(0.3)
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "429" in err_msg or "exhausted" in err_msg:
+                    await asyncio.sleep(2.0)
+                else:
+                    await asyncio.sleep(0.5)
                 continue
     return {}
 
@@ -120,23 +124,74 @@ def parse_statement_pdf(text: str) -> Dict[str, Any]:
     }
 
 def parse_digital_pdf_dekont(text: str) -> Dict[str, Any]:
-    t_up = text.upper()
+    text_clean = re.sub(r'\n+', '\n', text)
+    t_up = text_clean.upper()
+    
     is_demand = any(k in t_up for k in ["GİDEN FAST TALEP", "GIDEN FAST TALEP", "FAST TALEP", "İŞLEM TASLAĞI", "BEKLEYEN İŞLEM"])
     
-    ibans = re.findall(r'TR\s*\d{2}\s*(?:\d{4}\s*){5}\d{2}', text, re.IGNORECASE)
+    ibans = re.findall(r'TR\s*\d{2}\s*(?:\d{4}\s*){5}\d{2}', text_clean, re.IGNORECASE)
     rec_iban = re.sub(r'\s+', '', ibans[-1]).upper() if ibans else ""
     
-    amt_match = re.search(r'(?:TUTAR|TUTARI|ÖDEME\s*TUTARI)\s*[:.]?\s*(\d+(?:[.,]\d+)*)', text, re.IGNORECASE)
-    amount = amt_match.group(1) if amt_match else "0.0"
-    
-    sorgu_match = re.search(r'(?:Sorgu\s*No|Referans\s*No|İşlem\s*No|Dekont\s*No|Ref\s*No)\s*[:.]?\s*([0-9A-Za-z-]{6,35})', text, re.IGNORECASE)
-    sorgu = sorgu_match.group(1) if sorgu_match else ""
-    
-    sender_match = re.search(r'(?:Gönderen|Ödeyen|Müşteri\s*Adı)\s*[:.]?\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s.]{3,35})', text, re.IGNORECASE)
-    sender = sender_match.group(1).strip() if sender_match else "Belirsiz"
-    
-    rec_match = re.search(r'(?:Alıcı|Alacaklı|Lehtar)\s*[:.]?\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s.]{3,35})', text, re.IGNORECASE)
-    receiver = rec_match.group(1).strip() if rec_match else "Belirsiz"
+    amount = "0.00"
+    amt_match = re.search(r'(?:TUTAR|MEVDUAT|TOPLAM|Tutar)[^\d]*?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))', text_clean, re.IGNORECASE)
+    if amt_match:
+        amount = amt_match.group(1).replace(' ', '')
+    else:
+        amt_match2 = re.search(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))\s*(?:TL|TRY)', text_clean, re.IGNORECASE)
+        if amt_match2:
+            amount = amt_match2.group(1).replace(' ', '')
+            
+    sorgu = ""
+    sorgu_match = re.search(r'(?:SORGU\s*NO|FAST\s*NO|FAST\s*REF(?:ERANS)?\s*NO|İŞLEM\s*REF(?:ERANS)?|REFERANS\s*BİLGİSİ|REFERANS|REF\s*NO|İŞLEM\s*NO)[^\w]*([A-Z0-9-]{5,35})', text_clean, re.IGNORECASE)
+    if sorgu_match:
+        sorgu = sorgu_match.group(1).strip()
+        
+    sender = "Belirsiz"
+    receiver = "Belirsiz"
+
+    def clean_name(n: str) -> str:
+        n = re.split(r'(?i)\n|IBAN|TUTAR|ALICI|AÇIKLAMA|İşlem|Vergi|Müşteri', n)[0]
+        n = re.sub(r'[^A-ZÇĞİÖŞÜa-zçğıöşü\s./]', '', n)
+        return re.sub(r'\s+', ' ', n).strip()
+
+    s_patterns = [
+        r'(?:GÖNDEREN\s*ADI|GÖNDEREN\s*KİŞİ|GÖNDEREN|GÖNDERİCİ\s*ADI|HESAP\s*SAHİBİ|SAYIN)\s*[:|]?\s*[:|]?\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})',
+        r'Adı\s*Soyadı\s*\|\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})'
+    ]
+    for p in s_patterns:
+        m = re.search(p, text_clean, re.IGNORECASE)
+        if m:
+            s_val = clean_name(m.group(1))
+            if len(s_val) > 3 and "LÜTFEN" not in s_val.upper():
+                sender = s_val
+                break
+
+    r_patterns = [
+        r'(?:ALICI\s*ÜNVANI|ALICI\s*ADI\s*SOYADI|ALICI\s*ADI|ALACAKLI\s*ADI|ADI\s*ALICI|ALICI|ALACAKLI)\s*[:|]?\s*[:|]?\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})',
+        r'Alıcı\s*Adı\s*Soyadı\s*\|\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})'
+    ]
+    for p in r_patterns:
+        m = re.search(p, text_clean, re.IGNORECASE)
+        if m:
+            r_val = clean_name(m.group(1))
+            if len(r_val) > 3 and "LÜTFEN" not in r_val.upper():
+                receiver = r_val
+                break
+
+    akbank_names = re.findall(r'Adı\s*Soyadı/Unvan\s*\|\s*:\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})', text_clean, re.IGNORECASE)
+    if len(akbank_names) >= 2:
+        sender = clean_name(akbank_names[0])
+        receiver = clean_name(akbank_names[1])
+    elif len(akbank_names) == 1:
+        sender = clean_name(akbank_names[0])
+
+    if sender == "Belirsiz":
+        m = re.search(r'Vergi Dairesi.*?\n.*?\n([A-ZÇĞİÖŞÜ\s.]{5,40})\n', text_clean, re.IGNORECASE | re.DOTALL)
+        if m:
+            sender = clean_name(m.group(1))
+
+    tckn_match = re.search(r'\b([1-9][0-9]{10})\b', text_clean)
+    tckn = tckn_match.group(1) if tckn_match else ""
 
     return {
         "is_demand_only": is_demand,
@@ -148,15 +203,15 @@ def parse_digital_pdf_dekont(text: str) -> Dict[str, Any]:
         "amount": amount,
         "sorgu_no": sorgu,
         "date_str": "",
-        "tckn": ""
+        "tckn": tckn
     }
 
 def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[bool, str]:
     stmt_info["processed_count"] = stmt_info.get("processed_count", 0) + 1
     
     sender_name = dekont.get('sender_name', 'Belirsiz')
-    amount = dekont.get('amount', '0.00')
-    summary_line = f"{sender_name} | {amount} TL"
+    amount_str = dekont.get('amount', '0.00')
+    summary_line = f"{sender_name} | {amount_str} TL"
 
     if dekont.get("is_demand_only"):
         stmt_info["failed_count"] = stmt_info.get("failed_count", 0) + 1
@@ -166,7 +221,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
             "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
             f"👤 <b>Gönderen:</b> <code>{sender_name}</code>\n"
             f"🏢 <b>Alıcı:</b> <code>{dekont.get('receiver_name', 'Belirsiz')}</code>\n"
-            f"💰 <b>Tutar:</b> <code>{amount} TL</code>\n"
+            f"💰 <b>Tutar:</b> <code>{amount_str} TL</code>\n"
             f"🔢 <b>Ref:</b> <code>{dekont.get('sorgu_no', 'Belirsiz')}</code>\n"
             "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
             "⚠️ <i>Bu işlem sadece FAST talebidir. Para girişi olmamıştır.</i>"
@@ -185,7 +240,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
             "⚠️ <b>FARKLI HESABA GÖNDERİLMİŞ</b>\n"
             "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
             f"👤 <b>Gönderen:</b> <code>{sender_name}</code>\n"
-            f"💰 <b>Tutar:</b> <code>{amount} TL</code>\n"
+            f"💰 <b>Tutar:</b> <code>{amount_str} TL</code>\n"
             f"💳 <b>Hedef IBAN:</b> <code>{rec_iban}</code>\n"
             f"🏢 <b>Ekstre IBAN:</b> <code>{stmt_iban}</code>\n"
             "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
@@ -215,17 +270,29 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
                 break
 
     if not found:
-        sender_norm = normalize_text(dekont.get("sender_name", ""))
-        amt_raw = str(dekont.get("amount", "")).replace(" ", "").replace(",", ".")
+        sender_norm = normalize_text(sender_name)
+        amt_raw = str(amount_str).replace(" ", "")
         try:
+            if "," in amt_raw and "." in amt_raw:
+                if amt_raw.rfind(",") > amt_raw.rfind("."):
+                    amt_raw = amt_raw.replace(".", "").replace(",", ".")
+                else:
+                    amt_raw = amt_raw.replace(",", "")
+            elif "," in amt_raw:
+                amt_raw = amt_raw.replace(",", ".")
             amt_val = float(re.sub(r"[^\d.]", "", amt_raw))
         except Exception:
             amt_val = 0.0
 
+        amt_fmt1 = f"{amt_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        amt_fmt2 = f"{amt_val:.2f}"
+        amt_fmt3 = f"{int(amt_val)}"
+
         for l in stmt_lines:
             l_norm = normalize_text(l)
+            l_ns = l.replace(" ", "")
             if sender_norm and len(sender_norm) > 3 and sender_norm.split()[-1] in l_norm:
-                if amt_val > 0 and (f"{amt_val:.2f}" in l.replace(",", ".") or f"{int(amt_val)}" in l.replace(" ", "")):
+                if amt_val > 0 and (amt_fmt1 in l_ns or amt_fmt2 in l_ns or amt_fmt3 in l_ns):
                     found = True
                     reason = "İsim + Tutar Eşleşti"
                     proof = l
@@ -234,10 +301,11 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
         if not found and amt_val >= 10.0:
             for l in stmt_lines:
                 l_up = l.upper()
+                l_ns = l.replace(" ", "")
                 is_inflow = any(k in l_up for k in ["ALACAK", "GELEN", "FAST", "EFT", "HAVALE", "+"]) and "BORÇ" not in l_up and "BORC" not in l_up
-                if is_inflow and (f"{amt_val:.2f}" in l.replace(",", ".") or f"{int(amt_val)}" in l.replace(" ", "")):
+                if is_inflow and (amt_fmt1 in l_ns or amt_fmt2 in l_ns or amt_fmt3 in l_ns):
                     found = True
-                    reason = f"Tutar Para Girişi ({dekont.get('amount')} TL)"
+                    reason = f"Tutar Para Girişi ({amount_str} TL)"
                     proof = l
                     break
 
@@ -249,7 +317,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
             "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
             f"👤 <b>Gönderen:</b> <code>{sender_name}</code>\n"
             f"🏢 <b>Alıcı:</b> <code>{dekont.get('receiver_name', 'Belirsiz')}</code>\n"
-            f"💰 <b>Tutar:</b> <code>{amount} TL</code>\n"
+            f"💰 <b>Tutar:</b> <code>{amount_str} TL</code>\n"
             f"📅 <b>Tarih:</b> <code>{dekont.get('date_str', 'Belirsiz')}</code>\n"
             f"🔢 <b>Ref:</b> <code>{dekont.get('sorgu_no', 'Belirsiz')}</code>\n"
             "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
@@ -266,7 +334,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
         "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
         f"👤 <b>Gönderen:</b> <code>{sender_name}</code>\n"
         f"🏢 <b>Alıcı:</b> <code>{dekont.get('receiver_name', 'Belirsiz')}</code>\n"
-        f"💰 <b>Tutar:</b> <code>{amount} TL</code>\n"
+        f"💰 <b>Tutar:</b> <code>{amount_str} TL</code>\n"
         f"🔢 <b>Ref:</b> <code>{dekont.get('sorgu_no', 'Belirsiz')}</code>\n"
         "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
         "⚠️ <i>Bu işlem hesap hareketlerinizde mevcut değildir.</i>"
