@@ -1,0 +1,4 @@
+python-telegram-bot==21.10
+pymupdf==1.25.3
+google-genai==1.2.0
+pillow==11.1.0
