@@ -14,21 +14,21 @@ from google import genai
 from google.genai import types
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
 RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "")
-GEMINI_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+GEMINI_KEYS = list(set([k.strip() for k in RAW_KEYS.split(",") if k.strip()]))
 if not GEMINI_KEYS and os.environ.get("GEMINI_API_KEY"):
-    GEMINI_KEYS = [os.environ.get("GEMINI_API_KEY")]
+    GEMINI_KEYS = [os.environ.get("GEMINI_API_KEY").strip()]
 
 RAW_GROQ = os.environ.get("GROQ_API_KEYS", "")
-GROQ_KEYS = [k.strip() for k in RAW_GROQ.split(",") if k.strip()]
+GROQ_KEYS = list(set([k.strip() for k in RAW_GROQ.split(",") if k.strip()]))
 
 API_POOL = []
 for k in GEMINI_KEYS:
-    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k)})
+    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k), "rpm_limit": 5, "usage": []})
 for k in GROQ_KEYS:
-    API_POOL.append({"type": "groq", "key": k})
+    API_POOL.append({"type": "groq", "key": k, "rpm_limit": 25, "usage": []})
 
-api_cycle = itertools.cycle(API_POOL) if API_POOL else None
 chat_statements: Dict[int, Dict[str, Any]] = {}
 
 AUTH_USERS_RAW = os.environ.get("YETKILI_KISILER", "")
@@ -49,7 +49,7 @@ def is_auth(update: Update) -> bool:
 
 def pdf_to_jpeg_sync(file_bytes: bytes) -> bytes:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    return doc[0].get_pixmap(dpi=150).tobytes("jpeg")
+    return doc[0].get_pixmap(dpi=72).tobytes("jpeg")
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -135,6 +135,20 @@ async def cmd_analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
     st["panel_msg_id"] = msg.message_id
 
+async def get_available_api(attempted_keys: set) -> dict:
+    while True:
+        now = time.time()
+        available_nodes = [n for n in API_POOL if n["key"] not in attempted_keys]
+        if not available_nodes:
+            return None
+            
+        for node in available_nodes:
+            node["usage"] = [t for t in node["usage"] if now - t < 60]
+            if len(node["usage"]) < node["rpm_limit"]:
+                node["usage"].append(now)
+                return node
+        await asyncio.sleep(1.0)
+
 async def process_dekont_with_ai(image_bytes: bytes, chat_id: int) -> Tuple[bool, str]:
     st = chat_statements[chat_id]
     
@@ -182,8 +196,13 @@ Lütfen JSON dön:
         return False, "API Yok"
         
     last_error = "Bilinmeyen Hata"
-    for _ in range(len(API_POOL)):
-        api_node = next(api_cycle)
+    attempted_keys = set()
+    
+    while True:
+        api_node = await get_available_api(attempted_keys)
+        if not api_node:
+            break
+            
         try:
             if api_node["type"] == "gemini":
                 response = await asyncio.to_thread(
@@ -246,7 +265,7 @@ Lütfen JSON dön:
                     break
         except Exception as e:
             last_error = str(e)
-            await asyncio.sleep(1.0)
+            attempted_keys.add(api_node["key"])
             continue
             
     if not dekont_info:
