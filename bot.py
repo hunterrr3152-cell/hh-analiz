@@ -57,7 +57,7 @@ def pdf_to_jpeg_sync(file_bytes: bytes) -> bytes:
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return "".join(page.get_text("text") + "\n" for page in doc)
+    return "".join(page.get_text("layout") + "\n" for page in doc)
 
 def compress_image_for_ai(image_bytes: bytes) -> bytes:
     try:
@@ -340,9 +340,10 @@ async def get_available_api(attempted_keys: set) -> dict:
                 return node
         await asyncio.sleep(0.5)
 
-async def process_dekont_with_ai(image_bytes: bytes, chat_id: int) -> Tuple[bool, str]:
+async def process_dekont_with_ai(image_bytes: bytes, chat_id: int, text_content: str = None) -> Tuple[bool, str]:
     st = chat_statements[chat_id]
-    image_bytes = compress_image_for_ai(image_bytes)
+    if image_bytes:
+        image_bytes = compress_image_for_ai(image_bytes)
     
     if not st.get("unmatched_lines"):
         return False, "❌ Ekstrede eşleşecek işlem kalmadı"
@@ -397,6 +398,24 @@ Sadece JSON dön:
             break
             
         try:
+            if text_content:
+                gemini_contents = [text_content, prompt]
+                groq_content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": f"DEKONT METNİ:\n{text_content}"}
+                ]
+            else:
+                gemini_contents = [
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt
+                ]
+                import base64
+                b64_img = base64.b64encode(image_bytes).decode("utf-8")
+                groq_content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]
+
             if api_node["type"] == "gemini":
                 gemini_models = [
                     "gemini-3.7-flash",
@@ -412,10 +431,7 @@ Sadece JSON dön:
                             asyncio.to_thread(
                                 api_node["client"].models.generate_content,
                                 model=m_name,
-                                contents=[
-                                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                                    prompt
-                                ],
+                                contents=gemini_contents,
                                 config=types.GenerateContentConfig(
                                     response_mime_type="application/json",
                                     response_schema=schema,
@@ -438,8 +454,6 @@ Sadece JSON dön:
                     raise Exception("Gemini JSON Çözümleme Hatası")
                 break
             elif api_node["type"] == "groq":
-                import base64
-                b64_img = base64.b64encode(image_bytes).decode("utf-8")
                 headers = {
                     "Authorization": f"Bearer {api_node['key']}",
                     "Content-Type": "application/json"
@@ -449,10 +463,7 @@ Sadece JSON dön:
                     "messages": [
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                            ]
+                            "content": groq_content
                         }
                     ],
                     "temperature": 0.0,
@@ -549,7 +560,7 @@ Sadece JSON dön:
 async def analyze_worker(item: dict, chat_id: int, sem: asyncio.Semaphore) -> Tuple[bool, str, dict]:
     async with sem:
         try:
-            is_matched, res_text = await process_dekont_with_ai(item["bytes"], chat_id)
+            is_matched, res_text = await process_dekont_with_ai(item.get("bytes"), chat_id, text_content=item.get("text_content"))
             return is_matched, res_text, item
         except Exception as e:
             return False, f"❌ Kritik Sistem Hatası: {str(e)}", item
@@ -745,12 +756,19 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc = update.message.document
             file = await doc.get_file()
             f_bytes = bytes(await file.download_as_bytearray())
+            text_content = None
             if doc.file_name.lower().endswith(".pdf"):
-                file_bytes = await asyncio.to_thread(pdf_to_jpeg_sync, f_bytes)
+                text_content = extract_text_from_pdf(f_bytes)
+                if len(text_content.strip()) < 50:
+                    text_content = None
+                    file_bytes = await asyncio.to_thread(pdf_to_jpeg_sync, f_bytes)
+                else:
+                    file_bytes = None
             else:
                 file_bytes = f_bytes
-        if file_bytes:
-            st["queued_dekonts"].append({"bytes": file_bytes, "msg_id": msg_id, "url": None})
+        
+        if file_bytes or text_content:
+            st["queued_dekonts"].append({"bytes": file_bytes, "text_content": text_content, "msg_id": msg_id, "url": None})
             st["last_upload_time"] = time.time()
             if not st.get("debounce_task") or st["debounce_task"].done():
                 st["debounce_task"] = asyncio.create_task(smart_update_panel_debounced(chat_id, context))
