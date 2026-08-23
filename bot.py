@@ -313,6 +313,7 @@ Ekstre Sahibinin IBAN'ı: {st.get('iban', 'Bilinmiyor')}
 Kurallar:
 1. Görsel bir para transferi dekontu değilse (taslak, talep, hata sayfası vs.) is_dekont = false dön.
 2. Alıcı IBAN Kontrolü: Dekonttaki alıcı IBAN (veya maskeli hali, örn: TR12****34) ile üstteki Ekstre Sahibinin IBAN'ı açıkça uyuşmuyorsa is_iban_matched = false dön. Dekontta IBAN yoksa, gizliyse ve çelişmiyorsa veya sadece kolay adres varsa true dön.
+3. Tutar Kontrolü: Dekontta "İşlem Tutarı" ve "Masraf/Ücret" ayrı ayrı belirtilmişse (veya "Toplam Tutar" masrafla birlikte daha yüksekse), KESİNLİKLE sadece net transfer edilen "İşlem Tutarı"nı (Hesaba geçen/gönderilen saf parayı) baz al. Masraf eklenmiş "Toplam Tutar"ı çıkarma!
 
 Sadece JSON dön:
 {{
@@ -705,22 +706,27 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
             dl_tasks = [asyncio.create_task(download_worker(link)) for link in links]
             success_count = 0
+            last_edit_time = time.time()
             
             for i, coro in enumerate(asyncio.as_completed(dl_tasks)):
                 l_url, img_bytes = await coro
                 if img_bytes:
                     st["queued_dekonts"].append({"bytes": img_bytes, "msg_id": msg_id, "url": l_url})
                     success_count += 1
-                if i % 5 == 0 or i == total - 1:
+                
+                if time.time() - last_edit_time > 2.0 or i == total - 1:
                     try:
                         await tmp_msg.edit_text(f"⏳ Linkler İndiriliyor...\nDurum: {i+1} / {total}\nBaşarılı: {success_count} | Başarısız: {(i+1)-success_count}")
                     except Exception:
                         pass
+                    last_edit_time = time.time()
                         
             try:
-                await tmp_msg.edit_text(f"✅ <b>İndirme Tamamlandı!</b>\nToplam: {total} | Başarılı: {success_count} | Başarısız: {total - success_count}", parse_mode="HTML")
+                await tmp_msg.delete()
             except Exception:
                 pass
+            
+            st["state"] = "IDLE"
             st["last_upload_time"] = time.time()
             if not st.get("debounce_task") or st["debounce_task"].done():
                 st["debounce_task"] = asyncio.create_task(smart_update_panel_debounced(chat_id, context))
