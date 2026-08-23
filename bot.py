@@ -353,8 +353,8 @@ Ekstre Sahibinin IBAN'ı: {st.get('iban', 'Bilinmiyor')}
 
 Kurallar:
 1. Görsel bir para transferi dekontu değilse (taslak, talep, hata sayfası vs.) is_dekont = false dön.
-2. Alıcı IBAN Kontrolü: Dekonttaki alıcı IBAN (veya maskeli hali, örn: TR12****34) ile üstteki Ekstre Sahibinin IBAN'ı açıkça uyuşmuyorsa is_iban_matched = false dön. Dekontta IBAN yoksa, gizliyse ve çelişmiyorsa veya sadece kolay adres varsa true dön.
-3. Tutar Kontrolü: Dekontta "İşlem Tutarı" ve "Masraf/Ücret" ayrı ayrı belirtilmişse (veya "Toplam Tutar" masrafla birlikte daha yüksekse), KESİNLİKLE sadece net transfer edilen "İşlem Tutarı"nı (Hesaba geçen/gönderilen saf parayı) baz al. Masraf eklenmiş "Toplam Tutar"ı çıkarma!
+2. Alıcı IBAN Kontrolü: Dekonttaki alıcı IBAN (boşlukları yok sayarak, örn: TR12****34) ile üstteki Ekstre Sahibinin IBAN'ı açıkça uyuşmuyorsa is_iban_matched = false dön. Dekontta IBAN yoksa, gizliyse ve çelişmiyorsa veya sadece kolay adres varsa true dön.
+3. Tutar Kontrolü (ÇOK KRİTİK): Dekontta (özellikle Akbank vb.) "TOPLAM" veya "MEVDUAT" kısımlarında komisyon/vergi (BSMV vb.) eklenmiş şişirilmiş tutar (örn: 100.016,76) yazar. Bunu ASLA alma! Daima karşı tarafın hesabına geçen, komisyon ve vergilerin dahil OLMADIĞI saf NET transfer tutarını (örneğin ŞCH, Havale veya İşlem Tutarı karşısında yazan 100.000,00 gibi net rakamı) bul ve sadece onu ver. Masraf eklenmiş "Toplam Tutar"ı çıkarma!
 
 ÇOK ÖNEMLİ KURAL: Hiçbir açıklama, selamlama, düşünme süreci veya ekstra metin YAZMA. Sadece ve sadece süslü parantez ile başlayan ham JSON formatını dön!
 
