@@ -181,6 +181,7 @@ Lütfen JSON dön:
     if not API_POOL:
         return False, "API Yok"
         
+    last_error = "Bilinmeyen Hata"
     for _ in range(len(API_POOL)):
         api_node = next(api_cycle)
         try:
@@ -198,7 +199,10 @@ Lütfen JSON dön:
                         temperature=0.0
                     )
                 )
-                dekont_info = json.loads(response.text)
+                try:
+                    dekont_info = json.loads(response.text)
+                except Exception as je:
+                    raise Exception(f"Gemini JSON Hatası: {response.text}")
                 break
             elif api_node["type"] == "groq":
                 b64_img = base64.b64encode(image_bytes).decode('utf-8')
@@ -227,21 +231,26 @@ Lütfen JSON dön:
                 async with httpx.AsyncClient() as http_client:
                     resp = await http_client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=30.0)
                     if resp.status_code != 200:
-                        raise Exception()
+                        raise Exception(f"Groq API {resp.status_code}: {resp.text}")
                     data = resp.json()
                     content = data["choices"][0]["message"]["content"]
                     if "```json" in content:
                         content = content.split("```json")[1].split("```")[0].strip()
                     elif "```" in content:
                         content = content.split("```")[1].split("```")[0].strip()
-                    dekont_info = json.loads(content)
+                    
+                    try:
+                        dekont_info = json.loads(content)
+                    except Exception:
+                        raise Exception(f"Groq JSON Hatası: {content}")
                     break
-        except Exception:
+        except Exception as e:
+            last_error = str(e)
             await asyncio.sleep(1.0)
             continue
             
     if not dekont_info:
-        return False, "❌ Okunamadı (API Hatası)"
+        return False, f"❌ Okunamadı (Hata: {last_error})"
         
     sender = dekont_info.get("sender_name", "?")
     amt = dekont_info.get("amount", "0")
@@ -326,7 +335,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "cmd_upload_stmt":
         st["state"] = "WAIT_STATEMENT"
-        await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
+        try:
+            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
+        except Exception:
+            pass
     elif d == "cmd_upload_dekont":
         if not st.get("iban") or st["iban"] == "Bilinmiyor":
             st["state"] = "IDLE"
@@ -336,10 +348,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "WAIT_DEKONT"
-        await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
+        try:
+            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
+        except Exception:
+            pass
     elif d == "cmd_cancel":
         st["state"] = "IDLE"
-        await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+        try:
+            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+        except Exception:
+            pass
     elif d == "cmd_reset":
         st["unmatched_lines"] = {i: l for i, l in enumerate(st.get("lines", []))}
         st["queued_dekonts"] = []
@@ -348,10 +366,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["failed_count"] = 0
         st["failed_list"] = []
         st["state"] = "IDLE"
-        await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+        try:
+            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+        except Exception:
+            pass
     elif d == "cmd_stop":
         st["state"] = "IDLE"
-        await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+        try:
+            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+        except Exception:
+            pass
     elif d == "cmd_analyze":
         if not st["queued_dekonts"]:
             st["state"] = "IDLE"
@@ -361,7 +385,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "ANALYZING"
-        await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("ANALYZING"))
+        try:
+            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("ANALYZING"))
+        except Exception:
+            pass
         asyncio.create_task(run_analysis(chat_id, context, query.message.message_id))
 
 async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
