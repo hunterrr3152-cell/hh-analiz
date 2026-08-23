@@ -49,6 +49,37 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     return "".join(page.get_text("text") + "\n" for page in doc)
 
+async def fetch_image_from_link(url: str) -> bytes:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Upgrade-Insecure-Requests": "1"
+    }
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            if "prnt.sc" in url:
+                resp = await client.get(url, headers=headers, timeout=15.0)
+                if resp.status_code == 200:
+                    match = re.search(r'<img[^>]+id="screenshot-image"[^>]+src="([^"]+)"', resp.text)
+                    if match:
+                        img_url = match.group(1)
+                        if img_url.startswith("//"):
+                            img_url = "https:" + img_url
+                        img_resp = await client.get(img_url, headers=headers, timeout=15.0)
+                        if img_resp.status_code == 200:
+                            return img_resp.content
+            elif "imgur.com" in url:
+                if "i.imgur.com" not in url:
+                    img_id = url.rstrip("/").split("/")[-1]
+                    url = f"https://i.imgur.com/{img_id}.png"
+                resp = await client.get(url, headers=headers, timeout=15.0)
+                if resp.status_code == 200:
+                    return resp.content
+    except Exception:
+        pass
+    return None
+
 def parse_statement_pdf(text: str) -> Dict[str, Any]:
     ibans = re.findall(r'TR\s*\d{2}\s*(?:\d{4}\s*){5}\d{2}', text, re.IGNORECASE)
     stmt_iban = re.sub(r'\s+', '', ibans[0]).upper() if ibans else "Bilinmiyor"
@@ -65,7 +96,9 @@ def parse_statement_pdf(text: str) -> Dict[str, Any]:
         "failed_list": [],
         "state": "IDLE",
         "lock": asyncio.Lock(),
-        "panel_msg_id": None
+        "panel_msg_id": None,
+        "last_upload_time": 0,
+        "debounce_task": None
     }
 
 def get_menu_text(st: Dict[str, Any]) -> str:
@@ -89,7 +122,9 @@ def get_menu_text(st: Dict[str, Any]) -> str:
     if state == "WAIT_STATEMENT":
         text += "📂 <i>Lütfen PDF formatındaki hesap ekstresini gruba gönderin...</i>"
     elif state == "WAIT_DEKONT":
-        text += "🧾 <i>Lütfen dekontları (Fotoğraf veya PDF) gruba gönderin...\nYükledikçe yukarıdaki 'Kuyruktaki Dekontlar' sayısı canlı olarak artacaktır.\nİşleminiz bitince Analize Başla butonuna tıklayın.</i>"
+        text += "🧾 <i>Lütfen dekontları (Fotoğraf veya PDF) gruba gönderin...\nYükledikçe yukarıdaki 'Kuyruk' sayısı canlı olarak artacaktır.</i>"
+    elif state == "WAIT_LINK":
+        text += "🔗 <i>Lütfen prnt.sc veya imgur linklerini gruba gönderin...\nTek bir mesajın içine istediğiniz kadar link ekleyebilirsiniz.</i>"
     elif state == "ANALYZING":
         total = queued + st["processed_count"]
         text += f"⏳ <b>Analiz Ediliyor...</b> ({st['processed_count']} / {total})\n"
@@ -100,9 +135,7 @@ def get_menu_text(st: Dict[str, Any]) -> str:
     return text
 
 def get_menu_keyboard(state: str) -> InlineKeyboardMarkup:
-    if state == "WAIT_STATEMENT":
-        kb = [[InlineKeyboardButton("🔙 İptal", callback_data="cmd_cancel")]]
-    elif state == "WAIT_DEKONT":
+    if state in ["WAIT_STATEMENT", "WAIT_DEKONT", "WAIT_LINK"]:
         kb = [
             [InlineKeyboardButton("▶️ Analize Başla", callback_data="cmd_analyze")],
             [InlineKeyboardButton("🔙 İptal", callback_data="cmd_cancel")]
@@ -111,12 +144,40 @@ def get_menu_keyboard(state: str) -> InlineKeyboardMarkup:
         kb = [[InlineKeyboardButton("🛑 Analizi Durdur", callback_data="cmd_stop")]]
     else:
         kb = [
-            [InlineKeyboardButton("📂 Hesap Hareketleri Yükle", callback_data="cmd_upload_stmt")],
-            [InlineKeyboardButton("🧾 Dekont Yükle", callback_data="cmd_upload_dekont")],
+            [InlineKeyboardButton("📂 Ekstre Yükle", callback_data="cmd_upload_stmt"),
+             InlineKeyboardButton("🔗 Link Yükle", callback_data="cmd_upload_link")],
+            [InlineKeyboardButton("🧾 Foto/PDF Dekont Yükle", callback_data="cmd_upload_dekont")],
             [InlineKeyboardButton("▶️ Analize Başla", callback_data="cmd_analyze")],
-            [InlineKeyboardButton("🛑 Sıfırla", callback_data="cmd_reset")]
+            [InlineKeyboardButton("🛑 Sıfırla", callback_data="cmd_reset"),
+             InlineKeyboardButton("❌ Kapat", callback_data="cmd_close")]
         ]
     return InlineKeyboardMarkup(kb)
+
+async def replace_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    st = chat_statements.get(chat_id)
+    if not st: return
+    if st.get("panel_msg_id"):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=st["panel_msg_id"])
+        except Exception:
+            pass
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=get_menu_text(st),
+            parse_mode="HTML",
+            reply_markup=get_menu_keyboard(st["state"])
+        )
+        st["panel_msg_id"] = msg.message_id
+    except Exception:
+        pass
+
+async def update_panel_debounced(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    st = chat_statements.get(chat_id)
+    if not st: return
+    while time.time() - st.get("last_upload_time", 0) < 1.5:
+        await asyncio.sleep(0.5)
+    await replace_panel(chat_id, context)
 
 async def cmd_analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_auth(update):
@@ -192,7 +253,7 @@ Lütfen JSON dön:
     last_error = "Bilinmeyen Hata"
     attempted_keys = set()
     global_retry_count = 0
-    max_global_retries = 4 # wait up to 4x15 = 60 seconds
+    max_global_retries = 4
     
     while True:
         api_node = await get_available_api(attempted_keys)
@@ -295,17 +356,16 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
                 pass
             
         if time.time() - last_update > 2 or st["processed_count"] == total:
-            try:
-                await context.bot.edit_message_text(get_menu_text(st), chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=get_menu_keyboard("ANALYZING"))
-            except Exception:
-                pass
+            await replace_panel(chat_id, context)
             last_update = time.time()
             
     if st["state"] == "ANALYZING":
         st["state"] = "IDLE"
-        header_text = get_menu_text(st) + "\n\n🎯 <b>Analiz Tamamlandı!</b>\n\n"
+        st["queued_dekonts"].clear()
         
+        header_text = get_menu_text(st) + "\n\n🎯 <b>Analiz Tamamlandı!</b>\n\n"
         messages = []
+        
         if not st["failed_list"]:
             messages.append(header_text)
         else:
@@ -317,18 +377,20 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
                 current_msg += "\n\n" + fail_msg
             messages.append(current_msg)
             
+        if st.get("panel_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=st["panel_msg_id"])
+            except Exception:
+                pass
+                
         for i, msg in enumerate(messages):
             kb = get_menu_keyboard("IDLE") if i == len(messages) - 1 else None
             try:
-                if i == 0:
-                    await context.bot.edit_message_text(msg, chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=kb)
-                else:
-                    await context.bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
+                sent_msg = await context.bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
+                if i == len(messages) - 1:
+                    st["panel_msg_id"] = sent_msg.message_id
             except Exception:
-                try:
-                    await context.bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
-                except Exception:
-                    pass
+                pass
 
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -345,10 +407,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "cmd_upload_stmt":
         st["state"] = "WAIT_STATEMENT"
-        try:
-            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
-        except Exception:
-            pass
+        await replace_panel(chat_id, context)
     elif d == "cmd_upload_dekont":
         if not st.get("iban") or st["iban"] == "Bilinmiyor":
             st["state"] = "IDLE"
@@ -358,16 +417,20 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "WAIT_DEKONT"
-        try:
-            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
-        except Exception:
-            pass
+        await replace_panel(chat_id, context)
+    elif d == "cmd_upload_link":
+        if not st.get("iban") or st["iban"] == "Bilinmiyor":
+            st["state"] = "IDLE"
+            try:
+                await query.edit_message_text("⚠️ <b>Önce Hesap Hareketleri Yüklemelisiniz!</b>\n\n" + get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+            except Exception:
+                pass
+            return
+        st["state"] = "WAIT_LINK"
+        await replace_panel(chat_id, context)
     elif d == "cmd_cancel":
         st["state"] = "IDLE"
-        try:
-            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
-        except Exception:
-            pass
+        await replace_panel(chat_id, context)
     elif d == "cmd_reset":
         st["unmatched_lines"] = {i: l for i, l in enumerate(st.get("lines", []))}
         st["queued_dekonts"] = []
@@ -376,16 +439,17 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["failed_count"] = 0
         st["failed_list"] = []
         st["state"] = "IDLE"
-        try:
-            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
-        except Exception:
-            pass
+        await replace_panel(chat_id, context)
     elif d == "cmd_stop":
         st["state"] = "IDLE"
-        try:
-            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
-        except Exception:
-            pass
+        await replace_panel(chat_id, context)
+    elif d == "cmd_close":
+        if st.get("panel_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=st["panel_msg_id"])
+            except Exception:
+                pass
+        st["state"] = "CLOSED"
     elif d == "cmd_analyze":
         if not st["queued_dekonts"]:
             st["state"] = "IDLE"
@@ -395,10 +459,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "ANALYZING"
-        try:
-            await query.edit_message_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("ANALYZING"))
-        except Exception:
-            pass
+        await replace_panel(chat_id, context)
         asyncio.create_task(run_analysis(chat_id, context, query.message.message_id))
 
 async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,9 +471,9 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = chat_statements[chat_id]
     state = st.get("state", "IDLE")
 
-    if state == "WAIT_STATEMENT":
+    if state == "WAIT_STATEMENT" and update.message.document:
         doc = update.message.document
-        if not doc or not doc.file_name.lower().endswith(".pdf"):
+        if not doc.file_name.lower().endswith(".pdf"):
             return
         file = await doc.get_file()
         file_bytes = bytes(await file.download_as_bytearray())
@@ -422,15 +483,9 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             n_st["state"] = "IDLE"
             n_st["panel_msg_id"] = st.get("panel_msg_id")
             chat_statements[chat_id] = n_st
-            try:
-                await update.message.delete()
-            except Exception:
-                pass
-            if n_st["panel_msg_id"]:
-                try:
-                    await context.bot.edit_message_text(get_menu_text(n_st), chat_id=chat_id, message_id=n_st["panel_msg_id"], parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
-                except Exception:
-                    pass
+            n_st["last_upload_time"] = time.time()
+            if not n_st.get("debounce_task") or n_st["debounce_task"].done():
+                n_st["debounce_task"] = asyncio.create_task(update_panel_debounced(chat_id, context))
     
     elif state == "WAIT_DEKONT":
         file_bytes = None
@@ -448,15 +503,26 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_bytes = f_bytes
         if file_bytes:
             st["queued_dekonts"].append(file_bytes)
+            st["last_upload_time"] = time.time()
+            if not st.get("debounce_task") or st["debounce_task"].done():
+                st["debounce_task"] = asyncio.create_task(update_panel_debounced(chat_id, context))
+                
+    elif state == "WAIT_LINK" and update.message.text:
+        text = update.message.text
+        links = re.findall(r'(https?://(?:prnt\.sc|imgur\.com|\S*imgur\S*)[^\s]+)', text)
+        if links:
+            tmp_msg = await update.message.reply_text(f"⏳ {len(links)} adet link indiriliyor, lütfen bekleyin...")
+            for link in links:
+                img_bytes = await fetch_image_from_link(link)
+                if img_bytes:
+                    st["queued_dekonts"].append(img_bytes)
             try:
-                await update.message.delete()
+                await tmp_msg.delete()
             except Exception:
                 pass
-            if st.get("panel_msg_id"):
-                try:
-                    await context.bot.edit_message_text(get_menu_text(st), chat_id=chat_id, message_id=st["panel_msg_id"], parse_mode="HTML", reply_markup=get_menu_keyboard(st["state"]))
-                except Exception:
-                    pass
+            st["last_upload_time"] = time.time()
+            if not st.get("debounce_task") or st["debounce_task"].done():
+                st["debounce_task"] = asyncio.create_task(update_panel_debounced(chat_id, context))
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
@@ -467,6 +533,6 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("analiz", cmd_analiz))
     app.add_handler(CallbackQueryHandler(handle_callbacks))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_files))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.TEXT, handle_files))
     app.add_handler(MessageHandler(filters.ALL, fallback))
     app.run_polling()
