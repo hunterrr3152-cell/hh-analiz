@@ -385,7 +385,7 @@ Sadece JSON dön:
     last_error = "Bilinmeyen Hata"
     attempted_keys = set()
     global_retry_count = 0
-    max_global_retries = 4
+    max_global_retries = 1
     
     while True:
         api_node = await get_available_api(attempted_keys)
@@ -489,6 +489,8 @@ Sadece JSON dön:
                 break
         except Exception as e:
             last_error = str(e)
+            if "JSON" in last_error or "Format" in last_error:
+                break
             attempted_keys.add(api_node["key"])
             continue
             
