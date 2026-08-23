@@ -59,6 +59,23 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     return "".join(page.get_text("text") + "\n" for page in doc)
 
+def compress_image_for_ai(image_bytes: bytes) -> bytes:
+    try:
+        pix = fitz.Pixmap(image_bytes)
+        max_dim = 960.0
+        scale = 1.0
+        if max(pix.w, pix.h) > max_dim:
+            scale = max_dim / max(pix.w, pix.h)
+            
+        doc = fitz.open()
+        page = doc.new_page(width=pix.w * scale, height=pix.h * scale)
+        rect = fitz.Rect(0, 0, pix.w * scale, pix.h * scale)
+        page.insert_image(rect, stream=image_bytes)
+        out_pix = page.get_pixmap(dpi=72)
+        return out_pix.tobytes("jpeg", 80) # 80 quality for extra token saving
+    except Exception:
+        return image_bytes
+
 def parse_date_robust(date_str: str) -> datetime:
     ds = re.sub(r'[/_,-]', '.', date_str.strip())
     match = re.search(r'\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b', ds)
@@ -321,6 +338,8 @@ async def get_available_api(attempted_keys: set) -> dict:
 
 async def process_dekont_with_ai(image_bytes: bytes, chat_id: int) -> Tuple[bool, str]:
     st = chat_statements[chat_id]
+    image_bytes = compress_image_for_ai(image_bytes)
+    
     if not st.get("unmatched_lines"):
         return False, "❌ Ekstrede eşleşecek işlem kalmadı"
         
@@ -402,7 +421,7 @@ Sadece JSON dön:
                     "Content-Type": "application/json"
                 }
                 payload = {
-                    "model": "llama-4-scout-17bx16moe",
+                    "model": "qwen/qwen3.6-27b",
                     "messages": [
                         {
                             "role": "user",
