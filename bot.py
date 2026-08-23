@@ -3,10 +3,10 @@ import re
 import json
 import asyncio
 import itertools
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import fitz
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
 
@@ -54,6 +54,13 @@ JSON_SCHEMA = {
     },
     "required": ["is_demand_only", "sender_name", "receiver_name", "amount", "sorgu_no"]
 }
+
+def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("📊 Ekstre Durumu"), KeyboardButton("🧹 Ekstreyi Temizle")],
+        [KeyboardButton("❓ Nasıl Kullanılır?")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -104,7 +111,10 @@ def parse_statement_pdf(text: str) -> Dict[str, Any]:
     return {
         "iban": stmt_iban,
         "raw_text": text,
-        "lines": lines
+        "lines": lines,
+        "processed_count": 0,
+        "matched_count": 0,
+        "failed_count": 0
     }
 
 def parse_digital_pdf_dekont(text: str) -> Dict[str, Any]:
@@ -139,18 +149,22 @@ def parse_digital_pdf_dekont(text: str) -> Dict[str, Any]:
         "tckn": ""
     }
 
-def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> str:
+def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[bool, str]:
+    stmt_info["processed_count"] = stmt_info.get("processed_count", 0) + 1
+
     if dekont.get("is_demand_only"):
-        return (
-            "🚨 <b>HESABA GEÇMEDİ / ŞÜPHELİ İŞLEM</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Gönderen:</b> {dekont.get('sender_name')}\n"
-            f"🏢 <b>Alıcı:</b> {dekont.get('receiver_name')}\n"
-            f"💰 <b>Tutar:</b> <code>{dekont.get('amount')} TL</code>\n"
-            f"🔢 <b>Ref No:</b> <code>{dekont.get('sorgu_no')}</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "⚠️ <b>Uyarı:</b> Dekont bir <b>FAST Talebi / Taslaktır</b>. Hesaba para girişi olmamıştır."
+        stmt_info["failed_count"] = stmt_info.get("failed_count", 0) + 1
+        msg = (
+            "🚨 <b>HESABA GEÇMEDİ (TALEP / TASLAK)</b>\n"
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+            f"👤 <b>Gönderen:</b> <code>{dekont.get('sender_name', 'Belirsiz')}</code>\n"
+            f"🏢 <b>Alıcı:</b> <code>{dekont.get('receiver_name', 'Belirsiz')}</code>\n"
+            f"💰 <b>Tutar:</b> <code>{dekont.get('amount', '0.00')} TL</code>\n"
+            f"🔢 <b>Ref:</b> <code>{dekont.get('sorgu_no', 'Belirsiz')}</code>\n"
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+            "⚠️ <i>Bu işlem sadece FAST talebidir. Para girişi olmamıştır.</i>"
         )
+        return False, msg
 
     stmt_raw = stmt_info["raw_text"].upper()
     stmt_lines = stmt_info.get("lines", [])
@@ -158,16 +172,18 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> str:
     
     rec_iban = dekont.get("receiver_iban", "")
     if rec_iban and stmt_iban != "Bilinmiyor" and stmt_iban not in rec_iban and rec_iban not in stmt_iban:
-        return (
+        stmt_info["failed_count"] = stmt_info.get("failed_count", 0) + 1
+        msg = (
             "⚠️ <b>FARKLI HESABA GÖNDERİLMİŞ</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Gönderen:</b> {dekont.get('sender_name')}\n"
-            f"💰 <b>Tutar:</b> <code>{dekont.get('amount')} TL</code>\n"
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+            f"👤 <b>Gönderen:</b> <code>{dekont.get('sender_name', 'Belirsiz')}</code>\n"
+            f"💰 <b>Tutar:</b> <code>{dekont.get('amount', '0.00')} TL</code>\n"
             f"💳 <b>Hedef IBAN:</b> <code>{rec_iban}</code>\n"
             f"🏢 <b>Ekstre IBAN:</b> <code>{stmt_iban}</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📌 Dekonttaki IBAN ekstreniz ile eşleşmiyor."
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+            "📌 <i>Dekonttaki alıcı IBAN sizin ekstrenizle uyuşmuyor.</i>"
         )
+        return False, msg
 
     found = False
     proof = ""
@@ -176,7 +192,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> str:
     sorgu = str(dekont.get("sorgu_no", "")).strip().upper()
     if sorgu and len(sorgu) >= 5 and sorgu in stmt_raw:
         found = True
-        reason = f"Referans/Sorgu No Doğrulandı ({sorgu})"
+        reason = f"Ref/Sorgu No ({sorgu})"
         for l in stmt_lines:
             if sorgu in l.upper():
                 proof = l
@@ -184,7 +200,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> str:
 
     if not found and dekont.get("tckn") and len(dekont["tckn"]) == 11 and dekont["tckn"] in stmt_raw:
         found = True
-        reason = f"TCKN Doğrulandı ({dekont['tckn']})"
+        reason = f"TCKN ({dekont['tckn']})"
         for l in stmt_lines:
             if dekont["tckn"] in l:
                 proof = l
@@ -203,7 +219,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> str:
             if sender_norm and len(sender_norm) > 3 and sender_norm.split()[-1] in l_norm:
                 if amt_val > 0 and (f"{amt_val:.2f}" in l.replace(",", ".") or f"{int(amt_val)}" in l.replace(" ", "")):
                     found = True
-                    reason = "İsim ve Tutar Doğrulandı"
+                    reason = "İsim + Tutar Eşleşti"
                     proof = l
                     break
 
@@ -213,54 +229,122 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> str:
                 is_inflow = any(k in l_up for k in ["ALACAK", "GELEN", "FAST", "EFT", "HAVALE", "+"]) and "BORÇ" not in l_up and "BORC" not in l_up
                 if is_inflow and (f"{amt_val:.2f}" in l.replace(",", ".") or f"{int(amt_val)}" in l.replace(" ", "")):
                     found = True
-                    reason = f"Tutar Para Girişi ile Eşleşti ({dekont.get('amount')} TL)"
+                    reason = f"Tutar Para Girişi ({dekont.get('amount')} TL)"
                     proof = l
                     break
 
     if found:
-        res = (
+        stmt_info["matched_count"] = stmt_info.get("matched_count", 0) + 1
+        msg = (
             "✅ <b>HESABA BAŞARIYLA GEÇTİ</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Gönderen:</b> {dekont.get('sender_name')}\n"
-            f"🏢 <b>Alıcı:</b> {dekont.get('receiver_name')}\n"
-            f"💰 <b>Tutar:</b> <code>{dekont.get('amount')} TL</code>\n"
-            f"📅 <b>Tarih:</b> {dekont.get('date_str')}\n"
-            f"🔢 <b>Ref No:</b> <code>{dekont.get('sorgu_no')}</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>Yöntem:</b> {reason}\n"
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+            f"👤 <b>Gönderen:</b> <code>{dekont.get('sender_name', 'Belirsiz')}</code>\n"
+            f"🏢 <b>Alıcı:</b> <code>{dekont.get('receiver_name', 'Belirsiz')}</code>\n"
+            f"💰 <b>Tutar:</b> <code>{dekont.get('amount', '0.00')} TL</code>\n"
+            f"📅 <b>Tarih:</b> <code>{dekont.get('date_str', 'Belirsiz')}</code>\n"
+            f"🔢 <b>Ref:</b> <code>{dekont.get('sorgu_no', 'Belirsiz')}</code>\n"
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+            f"🎯 <b>Eşleşme:</b> <i>{reason}</i>\n"
         )
         if proof:
-            res += f"📌 <b>Kayıt:</b> <code>{proof[:120]}</code>"
-        return res
+            msg += f"📌 <b>Kayıt:</b> <code>{proof[:100]}</code>"
+        return True, msg
 
-    return (
-        "🚨 <b>HESABA GELMEDİ / EKSTREDE BULUNAMADI</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Gönderen:</b> {dekont.get('sender_name')}\n"
-        f"🏢 <b>Alıcı:</b> {dekont.get('receiver_name')}\n"
-        f"💰 <b>Tutar:</b> <code>{dekont.get('amount')} TL</code>\n"
-        f"🔢 <b>Ref No:</b> <code>{dekont.get('sorgu_no')}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Bu dekonta ait tutar veya sorgu numarası hesap ekstresinde yer almamaktadır."
+    stmt_info["failed_count"] = stmt_info.get("failed_count", 0) + 1
+    msg = (
+        "❌ <b>EKSTREDE BULUNAMADI</b>\n"
+        "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+        f"👤 <b>Gönderen:</b> <code>{dekont.get('sender_name', 'Belirsiz')}</code>\n"
+        f"🏢 <b>Alıcı:</b> <code>{dekont.get('receiver_name', 'Belirsiz')}</code>\n"
+        f"💰 <b>Tutar:</b> <code>{dekont.get('amount', '0.00')} TL</code>\n"
+        f"🔢 <b>Ref:</b> <code>{dekont.get('sorgu_no', 'Belirsiz')}</code>\n"
+        "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
+        "⚠️ <i>Bu işlem hesap hareketlerinizde mevcut değildir.</i>"
     )
+    return False, msg
+
+async def set_telegram_reaction(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, is_success: bool):
+    emoji = "👍" if is_success else "👎"
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[{"type": "emoji", "emoji": emoji}]
+        )
+    except Exception:
+        pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 <b>Dekont Doğrulama Botu</b>\n\n"
-        "1. Önce bankanızdan indirdiğiniz <b>Hesap Ekstresi PDF</b> dosyasını gönderin.\n"
-        "2. Ardından kontrol etmek istediğiniz dekontları (Fotoğraf veya PDF) iletin.",
+    msg = (
+        "🤖 <b>Otomatik Dekont Doğrulama Botu</b>\n\n"
+        "⚡ <b>Nasıl Kullanılır?</b>\n"
+        "1️⃣ Bankanızdan indirdiğiniz <b>Hesap Ekstresi PDF</b> dosyasını buraya gönderin.\n"
+        "2️⃣ Ardından kontrol edilecek tüm <b>Dekontları (Görsel veya PDF)</b> iletin.\n"
+        "3️⃣ Bot her dekontu alıntılayarak kontrol eder ve mesajınıza doğrudan tepki bırakır."
+    )
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def send_status(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if chat_id not in chat_statements:
+        inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❓ Yardım", callback_data="btn_help")]])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ <b>Hafızada aktif bir hesap ekstresi bulunmuyor.</b>\nLütfen önce ekstrenizi PDF olarak gönderin.",
+            parse_mode="HTML",
+            reply_markup=inline_kb
+        )
+        return
+
+    st = chat_statements[chat_id]
+    msg = (
+        "📊 <b>Aktif Oturum ve Ekstre Durumu</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 <b>Ekstre IBAN:</b> <code>{st['iban']}</code>\n"
+        f"📋 <b>Toplam Kayıt:</b> <code>{len(st['lines'])} satır</code>\n"
+        f"🔄 <b>İncelenen Dekont:</b> <code>{st.get('processed_count', 0)} adet</code>\n"
+        f"✅ <b>Doğrulanan (Geçen):</b> <code>{st.get('matched_count', 0)} adet</code>\n"
+        f"❌ <b>Bulunamayan:</b> <code>{st.get('failed_count', 0)} adet</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+    inline_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Ekstreyi Sıfırla", callback_data="btn_clear")]
+    ])
+    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=inline_kb)
+
+async def clear_statement(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if chat_id in chat_statements:
+        del chat_statements[chat_id]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🧹 <b>Hafızadaki ekstre başarıyla sıfırlandı.</b>\nYeni bir ekstre PDF dosyası yükleyebilirsiniz.",
         parse_mode="HTML"
     )
 
-async def temizle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     chat_id = update.effective_chat.id
-    if chat_id in chat_statements:
-        del chat_statements[chat_id]
-    await update.message.reply_text("🧹 Hafızadaki ekstre temizlendi. Yeni ekstre PDF yükleyebilirsiniz.")
+
+    if text == "📊 Ekstre Durumu":
+        await send_status(chat_id, context)
+    elif text in ["🧹 Ekstreyi Temizle", "/temizle", "/reset"]:
+        await clear_statement(chat_id, context)
+    elif text == "❓ Nasıl Kullanılır?":
+        await start(update, context)
+
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+
+    if query.data == "btn_clear":
+        await clear_statement(chat_id, context)
+    elif query.data == "btn_help":
+        await start(query, context)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     doc = update.message.document
+    msg_id = update.message.message_id
     file = await doc.get_file()
     file_bytes = bytes(await file.download_as_bytearray())
 
@@ -269,17 +353,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(k in text.upper() for k in ["HESAP HAREKET", "EKSTRE", "HESAP OZETI", "HESAP ÖZETİ", "GUNCEL BAKIYE", "GÜNCEL BAKİYE"]):
             stmt_info = parse_statement_pdf(text)
             chat_statements[chat_id] = stmt_info
+            
+            inline_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Durumu Görüntüle", callback_data="btn_status"), InlineKeyboardButton("🧹 Sıfırla", callback_data="btn_clear")]
+            ])
             await update.message.reply_text(
-                f"✅ <b>Hesap ekstresi hafızaya alındı.</b>\n"
+                f"✅ <b>Hesap Ekstresi Başarıyla Yüklendi!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💳 <b>IBAN:</b> <code>{stmt_info['iban']}</code>\n"
-                f"📋 <b>Satır Sayısı:</b> {len(stmt_info['lines'])}\n\n"
-                f"Dekontları gönderebilirsiniz.",
-                parse_mode="HTML"
+                f"📋 <b>Satır Sayısı:</b> <code>{len(stmt_info['lines'])}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Şimdi kontrol edilecek dekontları toplu veya tek tek gönderebilirsiniz.",
+                parse_mode="HTML",
+                reply_to_message_id=msg_id,
+                reply_markup=inline_kb
             )
+            await set_telegram_reaction(context, chat_id, msg_id, True)
             return
 
         if chat_id not in chat_statements:
-            await update.message.reply_text("⚠️ Lütfen önce karşılaştırma yapılacak <b>Hesap Ekstresi PDF</b> dosyasını yükleyin.")
+            await update.message.reply_text(
+                "⚠️ Lütfen önce karşılaştırma yapılacak <b>Hesap Ekstresi PDF</b> dosyasını yükleyin.",
+                parse_mode="HTML",
+                reply_to_message_id=msg_id
+            )
             return
 
         if len(text.strip()) > 60:
@@ -290,17 +387,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dekont_data = await parse_image_with_gemini(pix.tobytes("jpeg"))
     else:
         if chat_id not in chat_statements:
-            await update.message.reply_text("⚠️ Lütfen önce <b>Hesap Ekstresi PDF</b> dosyasını yükleyin.")
+            await update.message.reply_text(
+                "⚠️ Lütfen önce <b>Hesap Ekstresi PDF</b> dosyasını yükleyin.",
+                parse_mode="HTML",
+                reply_to_message_id=msg_id
+            )
             return
         dekont_data = await parse_image_with_gemini(file_bytes)
 
-    res = match_dekont(dekont_data, chat_statements[chat_id])
-    await update.message.reply_text(res, parse_mode="HTML")
+    is_matched, res_text = match_dekont(dekont_data, chat_statements[chat_id])
+    await update.message.reply_text(res_text, parse_mode="HTML", reply_to_message_id=msg_id)
+    await set_telegram_reaction(context, chat_id, msg_id, is_matched)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    msg_id = update.message.message_id
+
     if chat_id not in chat_statements:
-        await update.message.reply_text("⚠️ Lütfen önce karşılaştırma yapılacak <b>Hesap Ekstresi PDF</b> dosyasını yükleyin.")
+        await update.message.reply_text(
+            "⚠️ Lütfen önce karşılaştırma yapılacak <b>Hesap Ekstresi PDF</b> dosyasını yükleyin.",
+            parse_mode="HTML",
+            reply_to_message_id=msg_id
+        )
         return
 
     photo = update.message.photo[-1]
@@ -308,16 +416,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img_bytes = bytes(await file.download_as_bytearray())
 
     dekont_data = await parse_image_with_gemini(img_bytes)
-    res = match_dekont(dekont_data, chat_statements[chat_id])
-    await update.message.reply_text(res, parse_mode="HTML")
+    is_matched, res_text = match_dekont(dekont_data, chat_statements[chat_id])
+    await update.message.reply_text(res_text, parse_mode="HTML", reply_to_message_id=msg_id)
+    await set_telegram_reaction(context, chat_id, msg_id, is_matched)
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
         exit(1)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("temizle", temizle))
-    app.add_handler(CommandHandler("reset", temizle))
+    app.add_handler(CommandHandler("durum", lambda u, c: send_status(u.effective_chat.id, c)))
+    app.add_handler(CommandHandler("temizle", lambda u, c: clear_statement(u.effective_chat.id, c)))
+    app.add_handler(CommandHandler("reset", lambda u, c: clear_statement(u.effective_chat.id, c)))
+    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_menu))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.run_polling()
