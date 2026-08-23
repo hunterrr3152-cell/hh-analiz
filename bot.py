@@ -3,7 +3,6 @@ import re
 import json
 import asyncio
 import itertools
-import base64
 import httpx
 import time
 from typing import Dict, Any, Tuple
@@ -20,14 +19,9 @@ GEMINI_KEYS = list(set([k.strip() for k in RAW_KEYS.split(",") if k.strip()]))
 if not GEMINI_KEYS and os.environ.get("GEMINI_API_KEY"):
     GEMINI_KEYS = [os.environ.get("GEMINI_API_KEY").strip()]
 
-RAW_GROQ = os.environ.get("GROQ_API_KEYS", "")
-GROQ_KEYS = list(set([k.strip() for k in RAW_GROQ.split(",") if k.strip()]))
-
 API_POOL = []
 for k in GEMINI_KEYS:
     API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k), "rpm_limit": 5, "usage": []})
-for k in GROQ_KEYS:
-    API_POOL.append({"type": "groq", "key": k, "rpm_limit": 25, "usage": []})
 
 chat_statements: Dict[int, Dict[str, Any]] = {}
 
@@ -197,10 +191,17 @@ Lütfen JSON dön:
         
     last_error = "Bilinmeyen Hata"
     attempted_keys = set()
+    global_retry_count = 0
+    max_global_retries = 4 # wait up to 4x15 = 60 seconds
     
     while True:
         api_node = await get_available_api(attempted_keys)
         if not api_node:
+            if global_retry_count < max_global_retries:
+                global_retry_count += 1
+                attempted_keys.clear()
+                await asyncio.sleep(15.0)
+                continue
             break
             
         try:
@@ -208,7 +209,7 @@ Lütfen JSON dön:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         api_node["client"].models.generate_content,
-                        model='gemini-3.5-flash',
+                        model='gemini-3.5-flash-lite',
                         contents=[
                             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                             prompt
@@ -226,46 +227,6 @@ Lütfen JSON dön:
                 except Exception as je:
                     raise Exception(f"Gemini JSON Hatası: {response.text}")
                 break
-            elif api_node["type"] == "groq":
-                b64_img = base64.b64encode(image_bytes).decode('utf-8')
-                payload = {
-                    "model": "qwen/qwen3.6-27b",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt + "\n\nLütfen sadece yukarıdaki JSON formatında çıktı ver, başka hiçbir açıklama ekleme."},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{b64_img}"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    "temperature": 0.0
-                }
-                headers = {
-                    "Authorization": f"Bearer {api_node['key']}",
-                    "Content-Type": "application/json"
-                }
-                async with httpx.AsyncClient() as http_client:
-                    resp = await http_client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=30.0)
-                    if resp.status_code != 200:
-                        raise Exception(f"Groq API {resp.status_code}: {resp.text}")
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"]
-                    if "```json" in content:
-                        content = content.split("```json")[1].split("```")[0].strip()
-                    elif "```" in content:
-                        content = content.split("```")[1].split("```")[0].strip()
-                    
-                    try:
-                        dekont_info = json.loads(content)
-                    except Exception:
-                        raise Exception(f"Groq JSON Hatası: {content}")
-                    break
         except Exception as e:
             last_error = str(e)
             attempted_keys.add(api_node["key"])
@@ -313,7 +274,13 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
     for coro in asyncio.as_completed(tasks):
         if st["state"] != "ANALYZING":
             break
-        is_matched, res_text, f_bytes = await coro
+        try:
+            is_matched, res_text, f_bytes = await coro
+        except Exception as e:
+            is_matched = False
+            res_text = f"❌ Arka Plan Hatası: {str(e)}"
+            f_bytes = None
+            
         st["processed_count"] += 1
         if is_matched:
             st["matched_count"] += 1
@@ -321,10 +288,11 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
             st["failed_count"] += 1
             st["failed_list"].append(res_text)
             
-        try:
-            st["queued_dekonts"].remove(f_bytes)
-        except ValueError:
-            pass
+        if f_bytes:
+            try:
+                st["queued_dekonts"].remove(f_bytes)
+            except ValueError:
+                pass
             
         if time.time() - last_update > 2 or st["processed_count"] == total:
             try:
