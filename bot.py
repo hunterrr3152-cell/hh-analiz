@@ -21,7 +21,7 @@ if not GEMINI_KEYS and os.environ.get("GEMINI_API_KEY"):
 
 API_POOL = []
 for k in GEMINI_KEYS:
-    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k), "rpm_limit": 5, "usage": []})
+    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k), "rpm_limit": 14, "usage": []})
 
 chat_statements: Dict[int, Dict[str, Any]] = {}
 
@@ -50,34 +50,44 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "".join(page.get_text("text") + "\n" for page in doc)
 
 async def fetch_image_from_link(url: str) -> bytes:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Upgrade-Insecure-Requests": "1"
-    }
-    try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            if "prnt.sc" in url:
-                resp = await client.get(url, headers=headers, timeout=15.0)
-                if resp.status_code == 200:
-                    match = re.search(r'<img[^>]+id="screenshot-image"[^>]+src="([^"]+)"', resp.text)
-                    if match:
-                        img_url = match.group(1)
-                        if img_url.startswith("//"):
-                            img_url = "https:" + img_url
-                        img_resp = await client.get(img_url, headers=headers, timeout=15.0)
-                        if img_resp.status_code == 200:
-                            return img_resp.content
-            elif "imgur.com" in url:
-                if "i.imgur.com" not in url:
-                    img_id = url.rstrip("/").split("/")[-1]
-                    url = f"https://i.imgur.com/{img_id}.png"
-                resp = await client.get(url, headers=headers, timeout=15.0)
-                if resp.status_code == 200:
-                    return resp.content
-    except Exception:
-        pass
+    u_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+    ]
+    for attempt in range(5):
+        headers = {
+            "User-Agent": u_agents[attempt % len(u_agents)],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Upgrade-Insecure-Requests": "1",
+            "Referer": "https://www.google.com/"
+        }
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, verify=False) as client:
+                if "prnt.sc" in url:
+                    resp = await client.get(url, headers=headers, timeout=15.0)
+                    if resp.status_code == 200:
+                        match = re.search(r'<img[^>]+src="([^"]+)"', resp.text)
+                        if match:
+                            img_url = match.group(1)
+                            if img_url.startswith("//"):
+                                img_url = "https:" + img_url
+                            if "st.prntscr.com" not in img_url:
+                                img_resp = await client.get(img_url, headers=headers, timeout=15.0)
+                                if img_resp.status_code == 200:
+                                    return img_resp.content
+                elif "imgur.com" in url:
+                    if "i.imgur.com" not in url:
+                        img_id = url.rstrip("/").split("/")[-1]
+                        url = f"https://i.imgur.com/{img_id}.png"
+                    resp = await client.get(url, headers=headers, timeout=15.0)
+                    if resp.status_code == 200:
+                        return resp.content
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
     return None
 
 def parse_statement_pdf(text: str) -> Dict[str, Any]:
@@ -98,8 +108,15 @@ def parse_statement_pdf(text: str) -> Dict[str, Any]:
         "lock": asyncio.Lock(),
         "panel_msg_id": None,
         "last_upload_time": 0,
-        "debounce_task": None
+        "debounce_task": None,
+        "last_user_msg_id": 0
     }
+
+def get_pbar(current: int, total: int, length: int = 12) -> str:
+    if total == 0:
+        return "░" * length
+    filled = int((current / total) * length)
+    return "█" * filled + "░" * (length - filled)
 
 def get_menu_text(st: Dict[str, Any]) -> str:
     state = st["state"]
@@ -108,29 +125,32 @@ def get_menu_text(st: Dict[str, Any]) -> str:
     unmatched = st.get("unmatched_lines", {})
     queued = len(st.get("queued_dekonts", []))
     
-    text = "🤖 <b>Dekont Analiz Kontrol Paneli</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━\n"
-    text += f"🏦 <b>Ekstre Durumu:</b> {'✅ Yüklü' if iban != 'Bilinmiyor' else '❌ Yüklü Değil'}\n"
+    text = "💠 <b>DİJİTAL DEKONT ANALİZ MERKEZİ</b> 💠\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"🏦 <b>Ekstre:</b> {'✅ Yüklendi' if iban != 'Bilinmiyor' else '❌ Yüklü Değil'}\n"
     if iban != "Bilinmiyor":
         text += f"💳 <b>IBAN:</b> <code>{iban}</code>\n"
-        text += f"📋 <b>Toplam İşlem:</b> <code>{len(lines)} adet</code>\n"
-        text += f"⏳ <b>Eşleşme Bekleyen:</b> <code>{len(unmatched)} adet</code>\n"
-    text += "━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📦 <b>Kuyruktaki Dekontlar:</b> <code>{queued} adet</code>\n"
-    text += "━━━━━━━━━━━━━━━━━━━\n\n"
+        text += f"📋 <b>Sıradaki İşlem:</b> <code>{len(unmatched)} / {len(lines)} Bekliyor</code>\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📦 <b>Kuyruktaki Dekont:</b> <code>{queued} Adet</code>\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     if state == "WAIT_STATEMENT":
         text += "📂 <i>Lütfen PDF formatındaki hesap ekstresini gruba gönderin...</i>"
     elif state == "WAIT_DEKONT":
-        text += "🧾 <i>Lütfen dekontları (Fotoğraf veya PDF) gruba gönderin...\nYükledikçe yukarıdaki 'Kuyruk' sayısı canlı olarak artacaktır.</i>"
+        text += "🧾 <i>Lütfen dekontları (Fotoğraf/PDF) gruba gönderin...\nSiz yükledikçe sistem arka planda alacaktır.</i>"
     elif state == "WAIT_LINK":
-        text += "🔗 <i>Lütfen prnt.sc veya imgur linklerini gruba gönderin...\nTek bir mesajın içine istediğiniz kadar link ekleyebilirsiniz.</i>"
+        text += "🔗 <i>Lütfen prnt.sc veya imgur linklerini gönderin...\nTek mesajda toplu link gönderebilirsiniz.</i>"
     elif state == "ANALYZING":
         total = queued + st["processed_count"]
-        text += f"⏳ <b>Analiz Ediliyor...</b> ({st['processed_count']} / {total})\n"
-        text += f"✅ Başarılı: {st['matched_count']} | ❌ Başarısız: {st['failed_count']}"
+        pct = int((st['processed_count'] / total) * 100) if total > 0 else 0
+        bar = get_pbar(st['processed_count'], total)
+        text += f"⚡ <b>Yapay Zeka Analizi Sürüyor...</b>\n\n"
+        text += f"📊 <b>İlerleme:</b> {bar} <b>%{pct}</b>\n"
+        text += f"🔍 <b>Taranan:</b> {st['processed_count']} / {total}\n"
+        text += f"✅ <b>Eşleşen:</b> {st['matched_count']}   |   ❌ <b>Hatalı:</b> {st['failed_count']}"
     else:
-        text += "⚙️ <i>Lütfen yapmak istediğiniz işlemi aşağıdan seçin.</i>"
+        text += "⚙️ <i>Sistem Hazır. Lütfen aşağıdaki menüden işlem seçiniz.</i>"
         
     return text
 
@@ -148,14 +168,27 @@ def get_menu_keyboard(state: str) -> InlineKeyboardMarkup:
              InlineKeyboardButton("🔗 Link Yükle", callback_data="cmd_upload_link")],
             [InlineKeyboardButton("🧾 Foto/PDF Dekont Yükle", callback_data="cmd_upload_dekont")],
             [InlineKeyboardButton("▶️ Analize Başla", callback_data="cmd_analyze")],
-            [InlineKeyboardButton("🛑 Sıfırla", callback_data="cmd_reset"),
-             InlineKeyboardButton("❌ Kapat", callback_data="cmd_close")]
+            [InlineKeyboardButton("🛑 Sıfırlayıp Temizle", callback_data="cmd_reset")],
+            [InlineKeyboardButton("❌ Paneli Kapat", callback_data="cmd_close")]
         ]
     return InlineKeyboardMarkup(kb)
 
-async def replace_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def smart_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = chat_statements.get(chat_id)
     if not st: return
+    if st.get("panel_msg_id") and st["panel_msg_id"] > st.get("last_user_msg_id", 0):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=st["panel_msg_id"],
+                text=get_menu_text(st),
+                parse_mode="HTML",
+                reply_markup=get_menu_keyboard(st["state"])
+            )
+            return
+        except Exception:
+            pass
+            
     if st.get("panel_msg_id"):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=st["panel_msg_id"])
@@ -172,12 +205,12 @@ async def replace_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-async def update_panel_debounced(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def smart_update_panel_debounced(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = chat_statements.get(chat_id)
     if not st: return
     while time.time() - st.get("last_upload_time", 0) < 1.5:
         await asyncio.sleep(0.5)
-    await replace_panel(chat_id, context)
+    await smart_update_panel(chat_id, context)
 
 async def cmd_analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_auth(update):
@@ -187,6 +220,7 @@ async def cmd_analiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_statements[chat_id] = parse_statement_pdf("")
     st = chat_statements[chat_id]
     st["state"] = "IDLE"
+    st["last_user_msg_id"] = update.message.message_id
     msg = await update.message.reply_text(get_menu_text(st), parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
     st["panel_msg_id"] = msg.message_id
 
@@ -209,7 +243,7 @@ async def process_dekont_with_ai(image_bytes: bytes, chat_id: int) -> Tuple[bool
     
     unmatched_copy = dict(st.get("unmatched_lines", {}))
     if not unmatched_copy:
-        return False, "❌ [DEKONT] Ekstrede işlem kalmadı"
+        return False, "❌ Ekstrede eşleşecek işlem kalmadı"
         
     lines_text = "\n".join([f"{k}: {v}" for k, v in unmatched_copy.items()])
     if len(lines_text) > 800000:
@@ -248,7 +282,7 @@ Lütfen JSON dön:
     
     dekont_info = {}
     if not API_POOL:
-        return False, "API Yok"
+        return False, "API Bulunamadı"
         
     last_error = "Bilinmeyen Hata"
     attempted_keys = set()
@@ -286,7 +320,7 @@ Lütfen JSON dön:
                 try:
                     dekont_info = json.loads(response.text)
                 except Exception as je:
-                    raise Exception(f"Gemini JSON Hatası: {response.text}")
+                    raise Exception(f"JSON Çözümleme Hatası: {response.text}")
                 break
         except Exception as e:
             last_error = str(e)
@@ -294,7 +328,7 @@ Lütfen JSON dön:
             continue
             
     if not dekont_info:
-        return False, f"❌ Okunamadı (Hata: {last_error})"
+        return False, f"❌ Okunamadı (API/Sistem Hatası: {last_error})"
         
     sender = str(dekont_info.get("sender_name", "?")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     amt = str(dekont_info.get("amount", "0")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -310,13 +344,13 @@ Lütfen JSON dön:
         else:
             return False, f"❌ {summary_line}\n⚠️ <i>{reason}</i>"
 
-async def analyze_worker(file_bytes: bytes, chat_id: int, sem: asyncio.Semaphore) -> Tuple[bool, str, bytes]:
+async def analyze_worker(item: dict, chat_id: int, sem: asyncio.Semaphore) -> Tuple[bool, str, dict]:
     async with sem:
         try:
-            is_matched, res_text = await process_dekont_with_ai(file_bytes, chat_id)
-            return is_matched, res_text, file_bytes
+            is_matched, res_text = await process_dekont_with_ai(item["bytes"], chat_id)
+            return is_matched, res_text, item
         except Exception as e:
-            return False, f"❌ Sistem Hatası (Çökme): {str(e)}", file_bytes
+            return False, f"❌ Kritik Sistem Hatası: {str(e)}", item
 
 async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id: int):
     st = chat_statements.get(chat_id)
@@ -336,11 +370,11 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
         if st["state"] != "ANALYZING":
             break
         try:
-            is_matched, res_text, f_bytes = await coro
+            is_matched, res_text, item = await coro
         except Exception as e:
             is_matched = False
-            res_text = f"❌ Arka Plan Hatası: {str(e)}"
-            f_bytes = None
+            res_text = f"❌ Arka Plan Görev Hatası: {str(e)}"
+            item = None
             
         st["processed_count"] += 1
         if is_matched:
@@ -348,15 +382,24 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
         else:
             st["failed_count"] += 1
             st["failed_list"].append(res_text)
+            if item and item.get("msg_id"):
+                reply_txt = f"🔴 <b>İŞLEM BAŞARISIZ!</b>\n\n{res_text}"
+                if item.get("url"):
+                    reply_txt += f"\n\n🔗 <b>İlgili Link:</b> {item['url']}"
+                try:
+                    sent_fail = await context.bot.send_message(chat_id=chat_id, text=reply_txt, reply_to_message_id=item["msg_id"], parse_mode="HTML")
+                    st["last_user_msg_id"] = max(st.get("last_user_msg_id", 0), sent_fail.message_id)
+                except Exception:
+                    pass
             
-        if f_bytes:
+        if item:
             try:
-                st["queued_dekonts"].remove(f_bytes)
+                st["queued_dekonts"].remove(item)
             except ValueError:
                 pass
             
-        if time.time() - last_update > 2 or st["processed_count"] == total:
-            await replace_panel(chat_id, context)
+        if time.time() - last_update > 3 or st["processed_count"] == total:
+            await smart_update_panel(chat_id, context)
             last_update = time.time()
             
     if st["state"] == "ANALYZING":
@@ -407,7 +450,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "cmd_upload_stmt":
         st["state"] = "WAIT_STATEMENT"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
     elif d == "cmd_upload_dekont":
         if not st.get("iban") or st["iban"] == "Bilinmiyor":
             st["state"] = "IDLE"
@@ -417,7 +460,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "WAIT_DEKONT"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
     elif d == "cmd_upload_link":
         if not st.get("iban") or st["iban"] == "Bilinmiyor":
             st["state"] = "IDLE"
@@ -427,10 +470,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "WAIT_LINK"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
     elif d == "cmd_cancel":
         st["state"] = "IDLE"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
     elif d == "cmd_reset":
         st["unmatched_lines"] = {i: l for i, l in enumerate(st.get("lines", []))}
         st["queued_dekonts"] = []
@@ -439,10 +482,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["failed_count"] = 0
         st["failed_list"] = []
         st["state"] = "IDLE"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
     elif d == "cmd_stop":
         st["state"] = "IDLE"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
     elif d == "cmd_close":
         if st.get("panel_msg_id"):
             try:
@@ -459,7 +502,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         st["state"] = "ANALYZING"
-        await replace_panel(chat_id, context)
+        await smart_update_panel(chat_id, context)
         asyncio.create_task(run_analysis(chat_id, context, query.message.message_id))
 
 async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,6 +513,8 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     st = chat_statements[chat_id]
     state = st.get("state", "IDLE")
+    msg_id = update.message.message_id
+    st["last_user_msg_id"] = max(st.get("last_user_msg_id", 0), msg_id)
 
     if state == "WAIT_STATEMENT" and update.message.document:
         doc = update.message.document
@@ -482,10 +527,11 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             n_st = parse_statement_pdf(text)
             n_st["state"] = "IDLE"
             n_st["panel_msg_id"] = st.get("panel_msg_id")
+            n_st["last_user_msg_id"] = st.get("last_user_msg_id", 0)
             chat_statements[chat_id] = n_st
             n_st["last_upload_time"] = time.time()
             if not n_st.get("debounce_task") or n_st["debounce_task"].done():
-                n_st["debounce_task"] = asyncio.create_task(update_panel_debounced(chat_id, context))
+                n_st["debounce_task"] = asyncio.create_task(smart_update_panel_debounced(chat_id, context))
     
     elif state == "WAIT_DEKONT":
         file_bytes = None
@@ -502,27 +548,45 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 file_bytes = f_bytes
         if file_bytes:
-            st["queued_dekonts"].append(file_bytes)
+            st["queued_dekonts"].append({"bytes": file_bytes, "msg_id": msg_id, "url": None})
             st["last_upload_time"] = time.time()
             if not st.get("debounce_task") or st["debounce_task"].done():
-                st["debounce_task"] = asyncio.create_task(update_panel_debounced(chat_id, context))
+                st["debounce_task"] = asyncio.create_task(smart_update_panel_debounced(chat_id, context))
                 
     elif state == "WAIT_LINK" and update.message.text:
         text = update.message.text
         links = re.findall(r'(https?://(?:prnt\.sc|imgur\.com|\S*imgur\S*)[^\s]+)', text)
         if links:
-            tmp_msg = await update.message.reply_text(f"⏳ {len(links)} adet link indiriliyor, lütfen bekleyin...")
-            for link in links:
-                img_bytes = await fetch_image_from_link(link)
+            total = len(links)
+            tmp_msg = await update.message.reply_text(f"⏳ 0 / {total} link indiriliyor...")
+            st["last_user_msg_id"] = max(st.get("last_user_msg_id", 0), tmp_msg.message_id)
+            
+            sem_dl = asyncio.Semaphore(15)
+            async def download_worker(l_url):
+                async with sem_dl:
+                    return l_url, await fetch_image_from_link(l_url)
+                    
+            dl_tasks = [asyncio.create_task(download_worker(link)) for link in links]
+            success_count = 0
+            
+            for i, coro in enumerate(asyncio.as_completed(dl_tasks)):
+                l_url, img_bytes = await coro
                 if img_bytes:
-                    st["queued_dekonts"].append(img_bytes)
+                    st["queued_dekonts"].append({"bytes": img_bytes, "msg_id": msg_id, "url": l_url})
+                    success_count += 1
+                if i % 5 == 0 or i == total - 1:
+                    try:
+                        await tmp_msg.edit_text(f"⏳ Linkler İndiriliyor...\nDurum: {i+1} / {total}\nBaşarılı: {success_count} | Başarısız: {(i+1)-success_count}")
+                    except Exception:
+                        pass
+                        
             try:
                 await tmp_msg.delete()
             except Exception:
                 pass
             st["last_upload_time"] = time.time()
             if not st.get("debounce_task") or st["debounce_task"].done():
-                st["debounce_task"] = asyncio.create_task(update_panel_debounced(chat_id, context))
+                st["debounce_task"] = asyncio.create_task(smart_update_panel_debounced(chat_id, context))
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
