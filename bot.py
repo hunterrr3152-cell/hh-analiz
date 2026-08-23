@@ -303,24 +303,32 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
             
     if st["state"] == "ANALYZING":
         st["state"] = "IDLE"
-        final_text = get_menu_text(st) + "\n\n🎯 <b>Analiz Tamamlandı!</b>\n\n"
-        if st["failed_list"]:
-            failed_str = "<b>⚠️ Başarısız İşlem Detayları:</b>"
-            for i, fail_msg in enumerate(st["failed_list"]):
-                if len(final_text) + len(failed_str) + len(fail_msg) > 3900:
-                    kalan = len(st["failed_list"]) - i
-                    failed_str += f"\n\n<i>... ve {kalan} başarısız işlem daha sığmadığı için gizlendi.</i>"
-                    break
-                failed_str += "\n\n" + fail_msg
-            final_text += failed_str
+        header_text = get_menu_text(st) + "\n\n🎯 <b>Analiz Tamamlandı!</b>\n\n"
+        
+        messages = []
+        if not st["failed_list"]:
+            messages.append(header_text)
+        else:
+            current_msg = header_text + "<b>⚠️ Başarısız İşlem Detayları:</b>"
+            for fail_msg in st["failed_list"]:
+                if len(current_msg) + len(fail_msg) > 3900:
+                    messages.append(current_msg)
+                    current_msg = "<b>⚠️ (Devamı) Başarısız İşlem Detayları:</b>"
+                current_msg += "\n\n" + fail_msg
+            messages.append(current_msg)
             
-        try:
-            await context.bot.edit_message_text(final_text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
-        except Exception:
+        for i, msg in enumerate(messages):
+            kb = get_menu_keyboard("IDLE") if i == len(messages) - 1 else None
             try:
-                await context.bot.send_message(chat_id, final_text, parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+                if i == 0:
+                    await context.bot.edit_message_text(msg, chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=kb)
+                else:
+                    await context.bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
             except Exception:
-                pass
+                try:
+                    await context.bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    pass
 
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
