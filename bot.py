@@ -57,7 +57,7 @@ def pdf_to_jpeg_sync(file_bytes: bytes) -> bytes:
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return "".join(page.get_text("layout") + "\n" for page in doc)
+    return "".join(page.get_text("text", sort=True) + "\n" for page in doc)
 
 def compress_image_for_ai(image_bytes: bytes) -> bytes:
     try:
