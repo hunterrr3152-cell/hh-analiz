@@ -235,9 +235,9 @@ Lütfen JSON dön:
     if not dekont_info:
         return False, f"❌ Okunamadı (Hata: {last_error})"
         
-    sender = dekont_info.get("sender_name", "?")
-    amt = dekont_info.get("amount", "0")
-    reason = dekont_info.get("reason", "")
+    sender = str(dekont_info.get("sender_name", "?")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    amt = str(dekont_info.get("amount", "0")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    reason = str(dekont_info.get("reason", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     summary_line = f"👤 {sender} | 💰 {amt} TL"
     
     async with st["lock"]:
@@ -305,13 +305,22 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
         st["state"] = "IDLE"
         final_text = get_menu_text(st) + "\n\n🎯 <b>Analiz Tamamlandı!</b>\n\n"
         if st["failed_list"]:
-            final_text += "<b>⚠️ Başarısız İşlem Detayları:</b>\n" + "\n\n".join(st["failed_list"])
-        if len(final_text) > 4000:
-            final_text = final_text[:4000]
+            failed_str = "<b>⚠️ Başarısız İşlem Detayları:</b>"
+            for i, fail_msg in enumerate(st["failed_list"]):
+                if len(final_text) + len(failed_str) + len(fail_msg) > 3900:
+                    kalan = len(st["failed_list"]) - i
+                    failed_str += f"\n\n<i>... ve {kalan} başarısız işlem daha sığmadığı için gizlendi.</i>"
+                    break
+                failed_str += "\n\n" + fail_msg
+            final_text += failed_str
+            
         try:
             await context.bot.edit_message_text(final_text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
         except Exception:
-            await context.bot.send_message(chat_id, final_text, parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+            try:
+                await context.bot.send_message(chat_id, final_text, parse_mode="HTML", reply_markup=get_menu_keyboard("IDLE"))
+            except Exception:
+                pass
 
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
