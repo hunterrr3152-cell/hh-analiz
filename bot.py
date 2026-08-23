@@ -385,7 +385,7 @@ Sadece JSON dön:
                     "Content-Type": "application/json"
                 }
                 payload = {
-                    "model": "qwen/qwen3.6-27b",
+                    "model": "llama-3.2-11b-vision-preview",
                     "messages": [
                         {
                             "role": "user",
