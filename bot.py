@@ -82,12 +82,12 @@ def get_line_dates(line: str) -> list[datetime]:
 
 async def fetch_image_from_link(url: str) -> bytes:
     u_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
     ]
-    for attempt in range(5):
+    for attempt in range(8):
         headers = {
             "User-Agent": u_agents[attempt % len(u_agents)],
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -95,30 +95,47 @@ async def fetch_image_from_link(url: str) -> bytes:
             "Upgrade-Insecure-Requests": "1",
             "Referer": "https://www.google.com/"
         }
+        
+        target_url = url
+        if attempt >= 3 and attempt <= 4:
+            target_url = f"https://api.allorigins.win/raw?url={url}"
+        elif attempt >= 5:
+            target_url = f"https://corsproxy.io/?{url}"
+            
         try:
             async with httpx.AsyncClient(follow_redirects=True, verify=False) as client:
                 if "prnt.sc" in url:
-                    resp = await client.get(url, headers=headers, timeout=10.0)
-                    if resp.status_code == 200:
-                        match = re.search(r'<img[^>]+src="([^"]+)"', resp.text)
+                    resp = await client.get(target_url, headers=headers, timeout=15.0)
+                    if resp.status_code in [200, 304]:
+                        match = re.search(r'<img[^>]+id="screenshot-image"[^>]+src="([^"]+)"', resp.text)
+                        if not match:
+                            match = re.search(r'<img[^>]+src="([^"]+)"', resp.text)
                         if match:
                             img_url = match.group(1)
                             if img_url.startswith("//"):
                                 img_url = "https:" + img_url
                             if "st.prntscr.com" not in img_url:
-                                img_resp = await client.get(img_url, headers=headers, timeout=10.0)
+                                img_resp = await client.get(img_url, headers=headers, timeout=15.0)
                                 if img_resp.status_code == 200:
                                     return img_resp.content
+                                    
                 elif "imgur.com" in url:
                     if "i.imgur.com" not in url:
                         img_id = url.rstrip("/").split("/")[-1]
-                        url = f"https://i.imgur.com/{img_id}.png"
-                    resp = await client.get(url, headers=headers, timeout=10.0)
+                        fetch_url = f"https://i.imgur.com/{img_id}.png"
+                    else:
+                        fetch_url = url
+                        
+                    if attempt >= 3:
+                        fetch_url = f"https://api.allorigins.win/raw?url={fetch_url}"
+                        
+                    resp = await client.get(fetch_url, headers=headers, timeout=15.0)
                     if resp.status_code == 200:
                         return resp.content
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+            
+        await asyncio.sleep(1.0 + (attempt * 0.5))
     return None
 
 def parse_turkish_amount(amt_str: str) -> float:
@@ -699,7 +716,7 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_msg = await update.message.reply_text(f"⏳ 0 / {total} link indiriliyor...")
             st["last_user_msg_id"] = max(st.get("last_user_msg_id", 0), tmp_msg.message_id)
             
-            sem_dl = asyncio.Semaphore(30)
+            sem_dl = asyncio.Semaphore(8)
             async def download_worker(l_url):
                 async with sem_dl:
                     return l_url, await fetch_image_from_link(l_url)
