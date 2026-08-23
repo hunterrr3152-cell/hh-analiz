@@ -3,6 +3,8 @@ import re
 import json
 import asyncio
 import itertools
+import base64
+import httpx
 from typing import Dict, Any, List, Tuple
 import fitz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
@@ -12,16 +14,21 @@ from google.genai import types
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "")
-API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+GEMINI_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+if not GEMINI_KEYS and os.environ.get("GEMINI_API_KEY"):
+    GEMINI_KEYS = [os.environ.get("GEMINI_API_KEY")]
 
-if not API_KEYS and os.environ.get("GEMINI_API_KEY"):
-    API_KEYS = [os.environ.get("GEMINI_API_KEY")]
+RAW_GROQ = os.environ.get("GROQ_API_KEYS", "")
+GROQ_KEYS = [k.strip() for k in RAW_GROQ.split(",") if k.strip()]
 
-clients = [genai.Client(api_key=k) for k in API_KEYS]
-client_cycle = itertools.cycle(clients) if clients else None
+API_POOL = []
+for k in GEMINI_KEYS:
+    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k)})
+for k in GROQ_KEYS:
+    API_POOL.append({"type": "groq", "key": k})
 
+api_cycle = itertools.cycle(API_POOL) if API_POOL else None
 chat_statements: Dict[int, Dict[str, Any]] = {}
-api_semaphore = asyncio.Semaphore(max(1, len(API_KEYS) * 2))
 
 def pdf_to_jpeg_sync(file_bytes: bytes) -> bytes:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -102,27 +109,67 @@ Lütfen JSON dön:
         }
 
         dekont_info = {}
-        for _ in range(len(clients)):
-            client = next(client_cycle)
+        if not API_POOL:
+            return False, "⚠️ <b>Hata:</b> Sisteme tanımlı hiçbir API anahtarı (Gemini veya Groq) bulunamadı."
+        
+        for _ in range(len(API_POOL)):
+            api_node = next(api_cycle)
             try:
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model='gemini-2.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=schema,
-                        temperature=0.0
+                if api_node["type"] == "gemini":
+                    response = await asyncio.to_thread(
+                        api_node["client"].models.generate_content,
+                        model='gemini-3.5-flash',
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                            prompt
+                        ],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=schema,
+                            temperature=0.0
+                        )
                     )
-                )
-                dekont_info = json.loads(response.text)
-                break
+                    dekont_info = json.loads(response.text)
+                    break
+                elif api_node["type"] == "groq":
+                    b64_img = base64.b64encode(image_bytes).decode('utf-8')
+                    payload = {
+                        "model": "qwen/qwen3.6-27b",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt + "\n\nLütfen sadece yukarıdaki JSON formatında çıktı ver, başka hiçbir açıklama ekleme."},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{b64_img}"
+                                        }
+                                    }
+                                ]
+                            }
+                        ],
+                        "temperature": 0.0
+                    }
+                    headers = {
+                        "Authorization": f"Bearer {api_node['key']}",
+                        "Content-Type": "application/json"
+                    }
+                    async with httpx.AsyncClient() as http_client:
+                        resp = await http_client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=30.0)
+                        if resp.status_code != 200:
+                            raise Exception(f"Groq API Error: {resp.text}")
+                        data = resp.json()
+                        content = data["choices"][0]["message"]["content"]
+                        if "```json" in content:
+                            content = content.split("```json")[1].split("```")[0].strip()
+                        elif "```" in content:
+                            content = content.split("```")[1].split("```")[0].strip()
+                        dekont_info = json.loads(content)
+                        break
             except Exception as e:
                 err_msg = str(e).lower()
-                if "429" in err_msg or "exhausted" in err_msg:
+                if "429" in err_msg or "exhausted" in err_msg or "rate" in err_msg:
                     await asyncio.sleep(2.0)
                 else:
                     await asyncio.sleep(0.5)
