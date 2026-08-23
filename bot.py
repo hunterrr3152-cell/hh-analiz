@@ -5,6 +5,8 @@ import asyncio
 import itertools
 import httpx
 import time
+import difflib
+from datetime import datetime
 from typing import Dict, Any, Tuple
 import fitz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,7 +23,15 @@ if not GEMINI_KEYS and os.environ.get("GEMINI_API_KEY"):
 
 API_POOL = []
 for k in GEMINI_KEYS:
-    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k), "rpm_limit": 14, "usage": []})
+    API_POOL.append({"type": "gemini", "key": k, "client": genai.Client(api_key=k), "rpm_limit": 25, "usage": []})
+
+GROQ_RAW = os.environ.get("GROQ_API_KEYS", "")
+GROQ_KEYS = list(set([k.strip() for k in GROQ_RAW.split(",") if k.strip()]))
+if not GROQ_KEYS and os.environ.get("GROQ_API_KEY"):
+    GROQ_KEYS = [os.environ.get("GROQ_API_KEY").strip()]
+
+for k in GROQ_KEYS:
+    API_POOL.append({"type": "groq", "key": k, "rpm_limit": 14, "usage": []})
 
 chat_statements: Dict[int, Dict[str, Any]] = {}
 
@@ -49,6 +59,27 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     return "".join(page.get_text("text") + "\n" for page in doc)
 
+def parse_date_robust(date_str: str) -> datetime:
+    ds = re.sub(r'[/_,-]', '.', date_str.strip())
+    match = re.search(r'\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b', ds)
+    if not match: return None
+    day, month, year = match.groups()
+    if not year: year = str(datetime.now().year)
+    elif len(year) == 2: year = "20" + year
+    try: return datetime(int(year), int(month), int(day))
+    except: return None
+
+def get_line_dates(line: str) -> list[datetime]:
+    ds = re.sub(r'[/_,-]', '.', line)
+    matches = re.findall(r'\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b', ds)
+    res = []
+    for day, month, year in matches:
+        if not year: year = str(datetime.now().year)
+        elif len(year) == 2: year = "20" + year
+        try: res.append(datetime(int(year), int(month), int(day)))
+        except: pass
+    return res
+
 async def fetch_image_from_link(url: str) -> bytes:
     u_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
@@ -67,7 +98,7 @@ async def fetch_image_from_link(url: str) -> bytes:
         try:
             async with httpx.AsyncClient(follow_redirects=True, verify=False) as client:
                 if "prnt.sc" in url:
-                    resp = await client.get(url, headers=headers, timeout=15.0)
+                    resp = await client.get(url, headers=headers, timeout=10.0)
                     if resp.status_code == 200:
                         match = re.search(r'<img[^>]+src="([^"]+)"', resp.text)
                         if match:
@@ -75,20 +106,53 @@ async def fetch_image_from_link(url: str) -> bytes:
                             if img_url.startswith("//"):
                                 img_url = "https:" + img_url
                             if "st.prntscr.com" not in img_url:
-                                img_resp = await client.get(img_url, headers=headers, timeout=15.0)
+                                img_resp = await client.get(img_url, headers=headers, timeout=10.0)
                                 if img_resp.status_code == 200:
                                     return img_resp.content
                 elif "imgur.com" in url:
                     if "i.imgur.com" not in url:
                         img_id = url.rstrip("/").split("/")[-1]
                         url = f"https://i.imgur.com/{img_id}.png"
-                    resp = await client.get(url, headers=headers, timeout=15.0)
+                    resp = await client.get(url, headers=headers, timeout=10.0)
                     if resp.status_code == 200:
                         return resp.content
         except Exception:
             pass
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
     return None
+
+def parse_turkish_amount(amt_str: str) -> float:
+    amt_str = re.sub(r'[^\d.,]', '', amt_str)
+    if not amt_str: return 0.0
+    if '.' in amt_str and ',' in amt_str:
+        if amt_str.rfind('.') > amt_str.rfind(','):
+            amt_str = amt_str.replace(',', '')
+        else:
+            amt_str = amt_str.replace('.', '').replace(',', '.')
+    elif ',' in amt_str:
+        parts = amt_str.split(',')
+        if len(parts[-1]) <= 2:
+            amt_str = amt_str.replace(',', '.')
+        else:
+            amt_str = amt_str.replace(',', '')
+    else:
+        parts = amt_str.split('.')
+        if len(parts) > 1 and len(parts[-1]) <= 2:
+            pass
+        else:
+            amt_str = amt_str.replace('.', '')
+    try:
+        return float(amt_str)
+    except:
+        return 0.0
+
+def extract_all_amounts(line: str) -> list[float]:
+    words = line.split()
+    amts = []
+    for w in words:
+        if re.search(r'\d', w):
+            amts.append(parse_turkish_amount(w))
+    return amts
 
 def parse_statement_pdf(text: str) -> Dict[str, Any]:
     ibans = re.findall(r'TR\s*\d{2}\s*(?:\d{4}\s*){5}\d{2}', text, re.IGNORECASE)
@@ -208,7 +272,7 @@ async def smart_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 async def smart_update_panel_debounced(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = chat_statements.get(chat_id)
     if not st: return
-    while time.time() - st.get("last_upload_time", 0) < 1.5:
+    while time.time() - st.get("last_upload_time", 0) < 1.0:
         await asyncio.sleep(0.5)
     await smart_update_panel(chat_id, context)
 
@@ -236,48 +300,38 @@ async def get_available_api(attempted_keys: set) -> dict:
             if len(node["usage"]) < node["rpm_limit"]:
                 node["usage"].append(now)
                 return node
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
 async def process_dekont_with_ai(image_bytes: bytes, chat_id: int) -> Tuple[bool, str]:
     st = chat_statements[chat_id]
-    
-    unmatched_copy = dict(st.get("unmatched_lines", {}))
-    if not unmatched_copy:
+    if not st.get("unmatched_lines"):
         return False, "❌ Ekstrede eşleşecek işlem kalmadı"
         
-    lines_text = "\n".join([f"{k}: {v}" for k, v in unmatched_copy.items()])
-    if len(lines_text) > 800000:
-        lines_text = lines_text[:800000]
-        
-    prompt = f"""Görev: Ekteki dekont görüntüsünü analiz et ve aşağıdaki hesap ekstresi satırları arasında bu dekonta ait işlemi bul.
-Ekstre IBAN'ı: {st.get('iban', '')}
-Hesap Ekstresi Satırları (Format -> ID: Satır Metni):
-{lines_text}
+    prompt = f"""Görev: Ekteki dekont görüntüsünü analiz et ve bilgileri çıkar.
+Ekstre Sahibinin IBAN'ı: {st.get('iban', 'Bilinmiyor')}
+
 Kurallar:
-1. Dekonttaki Alıcı IBAN ile Ekstre IBAN'ı uyuşmalıdır. Dekontta IBAN gizlenmişse (örn: TR12****34) veya Kolay Adres (Telefon/TC) ise, uyumlu olup olmadığına bak. Kesin uyumsuzsa reddet.
-2. Dekont tarihi ile ekstre tarihi uyuşmalıdır (EFT/FAST valör farklarından dolayı 1-2 gün tolere edilebilir).
-3. Tutar kuruşu kuruşuna uyuşmalıdır.
-4. Sadece taslak/talep olan (gerçekleşmemiş) veya dekont olmayan görselleri reddet.
-Lütfen JSON dön:
+1. Görsel bir para transferi dekontu değilse (taslak, talep, hata sayfası vs.) is_dekont = false dön.
+2. Alıcı IBAN Kontrolü: Dekonttaki alıcı IBAN (veya maskeli hali, örn: TR12****34) ile üstteki Ekstre Sahibinin IBAN'ı açıkça uyuşmuyorsa is_iban_matched = false dön. Dekontta IBAN yoksa, gizliyse ve çelişmiyorsa veya sadece kolay adres varsa true dön.
+
+Sadece JSON dön:
 {{
-  "sender_name": "Gönderen Adı",
-  "amount": "Tutar",
-  "date": "Tarih",
-  "is_matched": true/false,
-  "matched_line_id": eşleşen satırın ID'si (eşleşme yoksa -1),
-  "reason": "Neden eşleşti veya eşleşmedi (kısa açıklama)"
+  "sender_name": "Gönderen Adı Soyadı",
+  "amount": 1500.50,
+  "date": "15.08.2023",
+  "is_iban_matched": true,
+  "is_dekont": true
 }}"""
     schema = {
         "type": "OBJECT",
         "properties": {
             "sender_name": {"type": "STRING"},
-            "amount": {"type": "STRING"},
+            "amount": {"type": "NUMBER"},
             "date": {"type": "STRING"},
-            "is_matched": {"type": "BOOLEAN"},
-            "matched_line_id": {"type": "INTEGER"},
-            "reason": {"type": "STRING"}
+            "is_iban_matched": {"type": "BOOLEAN"},
+            "is_dekont": {"type": "BOOLEAN"}
         },
-        "required": ["sender_name", "amount", "date", "is_matched", "matched_line_id", "reason"]
+        "required": ["sender_name", "amount", "date", "is_iban_matched", "is_dekont"]
     }
     
     dekont_info = {}
@@ -295,7 +349,7 @@ Lütfen JSON dön:
             if global_retry_count < max_global_retries:
                 global_retry_count += 1
                 attempted_keys.clear()
-                await asyncio.sleep(15.0)
+                await asyncio.sleep(5.0)
                 continue
             break
             
@@ -315,12 +369,47 @@ Lütfen JSON dön:
                             temperature=0.0
                         )
                     ),
-                    timeout=60.0
+                    timeout=30.0
                 )
                 try:
                     dekont_info = json.loads(response.text)
-                except Exception as je:
-                    raise Exception(f"JSON Çözümleme Hatası: {response.text}")
+                except Exception:
+                    raise Exception("Gemini JSON Çözümleme Hatası")
+                break
+            elif api_node["type"] == "groq":
+                import base64
+                b64_img = base64.b64encode(image_bytes).decode("utf-8")
+                headers = {
+                    "Authorization": f"Bearer {api_node['key']}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": "qwen/qwen3.6-27b",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                            ]
+                        }
+                    ],
+                    "temperature": 0.0
+                }
+                async with httpx.AsyncClient(verify=False) as client:
+                    resp = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
+                if resp.status_code == 200:
+                    resp_json = resp.json()
+                    content = resp_json["choices"][0]["message"]["content"]
+                    match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if match:
+                        dekont_info = json.loads(match.group(0))
+                    else:
+                        raise Exception("Groq JSON Formatı Bulunamadı")
+                elif resp.status_code == 429:
+                    raise Exception("Groq Rate Limit")
+                else:
+                    raise Exception(f"Groq Hatası: {resp.status_code}")
                 break
         except Exception as e:
             last_error = str(e)
@@ -328,21 +417,69 @@ Lütfen JSON dön:
             continue
             
     if not dekont_info:
-        return False, f"❌ Okunamadı (API/Sistem Hatası: {last_error})"
+        return False, f"❌ Okunamadı (API Hatası: {last_error})"
         
-    sender = str(dekont_info.get("sender_name", "?")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    amt = str(dekont_info.get("amount", "0")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    reason = str(dekont_info.get("reason", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    summary_line = f"👤 {sender} | 💰 {amt} TL"
+    if not dekont_info.get("is_dekont"):
+        return False, "❌ 👤 ? | 💰 0 TL\n⚠️ <i>Bu görsel geçerli bir dekont değil.</i>"
+
+    try:
+        ai_amt = float(dekont_info.get("amount", 0))
+    except:
+        ai_amt = 0.0
+        
+    ai_name = str(dekont_info.get("sender_name", "?")).upper()
+    ai_name_clean = ai_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    summary_line = f"👤 {ai_name_clean} | 💰 {ai_amt} TL"
     
+    if ai_amt <= 0:
+        return False, f"❌ {summary_line}\n⚠️ <i>Tutar net okunamadı.</i>"
+
+    if not dekont_info.get("is_iban_matched", True):
+        return False, f"❌ {summary_line}\n⚠️ <i>Alıcı IBAN ekstre sahibi ile eşleşmedi! (Farklı hesaba gönderilmiş)</i>"
+
+    ai_date_obj = parse_date_robust(dekont_info.get("date", ""))
+
     async with st["lock"]:
-        if dekont_info.get("is_matched") and dekont_info.get("matched_line_id") in st["unmatched_lines"]:
-            st["unmatched_lines"].pop(dekont_info["matched_line_id"])
-            return True, summary_line
-        elif dekont_info.get("is_matched"):
-            return False, f"❌ {summary_line}\n⚠️ <i>Satır başka bir dekont ile eşleşti (Çakışma)</i>"
-        else:
-            return False, f"❌ {summary_line}\n⚠️ <i>{reason}</i>"
+        candidates = []
+        for line_id, line_text in st["unmatched_lines"].items():
+            line_amts = extract_all_amounts(line_text)
+            if any(abs(la - ai_amt) < 0.01 for la in line_amts):
+                candidates.append((line_id, line_text))
+        
+        if not candidates:
+            return False, f"❌ {summary_line}\n⚠️ <i>Ekstrede bu tutarda ({ai_amt} TL) işlem bulunamadı.</i>"
+            
+        best_score = -999.0
+        best_id = candidates[0][0]
+        
+        for cid, ctext in candidates:
+            name_score = difflib.SequenceMatcher(None, ai_name, ctext.upper()).ratio()
+            date_score = 0.0
+            if ai_date_obj:
+                c_dates = get_line_dates(ctext)
+                if c_dates:
+                    min_diff = 9999
+                    for cd in c_dates:
+                        diff = abs((cd - ai_date_obj).days)
+                        if cd.day == ai_date_obj.day and cd.month == ai_date_obj.month:
+                            diff = min(diff, 0)
+                        min_diff = min(min_diff, diff)
+                        
+                    if min_diff <= 2:
+                        date_score = 1.0 - (min_diff * 0.2)
+                    else:
+                        date_score = -2.0
+            
+            total_score = name_score + date_score
+            if total_score > best_score:
+                best_score = total_score
+                best_id = cid
+                
+        if best_score < -0.5:
+            return False, f"❌ {summary_line}\n⚠️ <i>Tutar uyuyor ancak TARIH veya ALICI İSMİ tamamen hatalı! (Çakışma Önlendi)</i>"
+                
+        st["unmatched_lines"].pop(best_id)
+        return True, summary_line
 
 async def analyze_worker(item: dict, chat_id: int, sem: asyncio.Semaphore) -> Tuple[bool, str, dict]:
     async with sem:
@@ -398,7 +535,7 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
             except ValueError:
                 pass
             
-        if time.time() - last_update > 3 or st["processed_count"] == total:
+        if time.time() - last_update > 2 or st["processed_count"] == total:
             await smart_update_panel(chat_id, context)
             last_update = time.time()
             
@@ -561,7 +698,7 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_msg = await update.message.reply_text(f"⏳ 0 / {total} link indiriliyor...")
             st["last_user_msg_id"] = max(st.get("last_user_msg_id", 0), tmp_msg.message_id)
             
-            sem_dl = asyncio.Semaphore(15)
+            sem_dl = asyncio.Semaphore(30)
             async def download_worker(l_url):
                 async with sem_dl:
                     return l_url, await fetch_image_from_link(l_url)
@@ -581,7 +718,7 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                         
             try:
-                await tmp_msg.delete()
+                await tmp_msg.edit_text(f"✅ <b>İndirme Tamamlandı!</b>\nToplam: {total} | Başarılı: {success_count} | Başarısız: {total - success_count}", parse_mode="HTML")
             except Exception:
                 pass
             st["last_upload_time"] = time.time()
