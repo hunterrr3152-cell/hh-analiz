@@ -402,7 +402,7 @@ Sadece JSON dön:
                     "Content-Type": "application/json"
                 }
                 payload = {
-                    "model": "meta-llama/llama-prompt-guard-2-22m",
+                    "model": "llama-4-scout-17bx16moe",
                     "messages": [
                         {
                             "role": "user",
