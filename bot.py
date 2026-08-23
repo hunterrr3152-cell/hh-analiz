@@ -409,8 +409,7 @@ Sadece JSON dön:
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             response_schema=schema,
-                            temperature=0.0,
-                            max_output_tokens=150
+                            temperature=0.0
                         )
                     ),
                     timeout=30.0
@@ -439,7 +438,7 @@ Sadece JSON dön:
                         }
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 150
+                    "response_format": {"type": "json_object"}
                 }
                 async with httpx.AsyncClient(verify=False) as client:
                     resp = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
@@ -448,9 +447,12 @@ Sadece JSON dön:
                     content = resp_json["choices"][0]["message"]["content"]
                     match = re.search(r'\{.*\}', content, re.DOTALL)
                     if match:
-                        dekont_info = json.loads(match.group(0))
+                        try:
+                            dekont_info = json.loads(match.group(0))
+                        except Exception:
+                            raise Exception(f"Groq JSON Çözülemedi. İçerik: {content[:80]}")
                     else:
-                        raise Exception("Groq JSON Formatı Bulunamadı")
+                        raise Exception(f"Groq JSON Formatı Bulunamadı. İçerik: {content[:80]}")
                 elif resp.status_code == 429:
                     raise Exception("Groq Rate Limit")
                 else:
