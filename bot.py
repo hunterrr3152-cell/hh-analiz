@@ -83,7 +83,7 @@ async def parse_image_with_gemini(image_bytes: bytes) -> Dict[str, Any]:
             try:
                 response = await asyncio.to_thread(
                     client.models.generate_content,
-                    model='gemini-2.5-flash-lite',
+                    model='gemini-3.5-flash',
                     contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                         PROMPT_DEKONT
@@ -233,20 +233,6 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
     stmt_iban = stmt_info["iban"]
     
     rec_iban = dekont.get("receiver_iban", "")
-    if rec_iban and stmt_iban != "Bilinmiyor" and stmt_iban not in rec_iban and rec_iban not in stmt_iban:
-        stmt_info["failed_count"] = stmt_info.get("failed_count", 0) + 1
-        stmt_info["failed_list"].append(f"[FARKLI IBAN] {summary_line}")
-        msg = (
-            "⚠️ <b>FARKLI HESABA GÖNDERİLMİŞ</b>\n"
-            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
-            f"👤 <b>Gönderen:</b> <code>{sender_name}</code>\n"
-            f"💰 <b>Tutar:</b> <code>{amount_str} TL</code>\n"
-            f"💳 <b>Hedef IBAN:</b> <code>{rec_iban}</code>\n"
-            f"🏢 <b>Ekstre IBAN:</b> <code>{stmt_iban}</code>\n"
-            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
-            "📌 <i>Dekonttaki alıcı IBAN sizin ekstrenizle uyuşmuyor.</i>"
-        )
-        return False, msg
 
     found = False
     proof = ""
