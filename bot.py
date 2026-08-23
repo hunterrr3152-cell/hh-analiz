@@ -123,88 +123,6 @@ def parse_statement_pdf(text: str) -> Dict[str, Any]:
         "failed_list": []
     }
 
-def parse_digital_pdf_dekont(text: str) -> Dict[str, Any]:
-    text_clean = re.sub(r'\n+', '\n', text)
-    t_up = text_clean.upper()
-    
-    is_demand = any(k in t_up for k in ["GİDEN FAST TALEP", "GIDEN FAST TALEP", "FAST TALEP", "İŞLEM TASLAĞI", "BEKLEYEN İŞLEM"])
-    
-    ibans = re.findall(r'TR\s*\d{2}\s*(?:\d{4}\s*){5}\d{2}', text_clean, re.IGNORECASE)
-    rec_iban = re.sub(r'\s+', '', ibans[-1]).upper() if ibans else ""
-    
-    amount = "0.00"
-    amt_match = re.search(r'(?:TUTAR|MEVDUAT|TOPLAM|Tutar)[^\d]*?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))', text_clean, re.IGNORECASE)
-    if amt_match:
-        amount = amt_match.group(1).replace(' ', '')
-    else:
-        amt_match2 = re.search(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))\s*(?:TL|TRY)', text_clean, re.IGNORECASE)
-        if amt_match2:
-            amount = amt_match2.group(1).replace(' ', '')
-            
-    sorgu = ""
-    sorgu_match = re.search(r'(?:SORGU\s*NO|FAST\s*NO|FAST\s*REF(?:ERANS)?\s*NO|İŞLEM\s*REF(?:ERANS)?|REFERANS\s*BİLGİSİ|REFERANS|REF\s*NO|İŞLEM\s*NO)[^\w]*([A-Z0-9-]{5,35})', text_clean, re.IGNORECASE)
-    if sorgu_match:
-        sorgu = sorgu_match.group(1).strip()
-        
-    sender = "Belirsiz"
-    receiver = "Belirsiz"
-
-    def clean_name(n: str) -> str:
-        n = re.split(r'(?i)\n|IBAN|TUTAR|ALICI|AÇIKLAMA|İşlem|Vergi|Müşteri', n)[0]
-        n = re.sub(r'[^A-ZÇĞİÖŞÜa-zçğıöşü\s./]', '', n)
-        return re.sub(r'\s+', ' ', n).strip()
-
-    s_patterns = [
-        r'(?:GÖNDEREN\s*ADI|GÖNDEREN\s*KİŞİ|GÖNDEREN|GÖNDERİCİ\s*ADI|HESAP\s*SAHİBİ|SAYIN)\s*[:|]?\s*[:|]?\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})',
-        r'Adı\s*Soyadı\s*\|\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})'
-    ]
-    for p in s_patterns:
-        m = re.search(p, text_clean, re.IGNORECASE)
-        if m:
-            s_val = clean_name(m.group(1))
-            if len(s_val) > 3 and "LÜTFEN" not in s_val.upper():
-                sender = s_val
-                break
-
-    r_patterns = [
-        r'(?:ALICI\s*ÜNVANI|ALICI\s*ADI\s*SOYADI|ALICI\s*ADI|ALACAKLI\s*ADI|ADI\s*ALICI|ALICI|ALACAKLI)\s*[:|]?\s*[:|]?\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})',
-        r'Alıcı\s*Adı\s*Soyadı\s*\|\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})'
-    ]
-    for p in r_patterns:
-        m = re.search(p, text_clean, re.IGNORECASE)
-        if m:
-            r_val = clean_name(m.group(1))
-            if len(r_val) > 3 and "LÜTFEN" not in r_val.upper():
-                receiver = r_val
-                break
-
-    akbank_names = re.findall(r'Adı\s*Soyadı/Unvan\s*\|\s*:\s*([A-ZÇĞİÖŞÜa-zçğıöşü\s./]{3,60})', text_clean, re.IGNORECASE)
-    if len(akbank_names) >= 2:
-        sender = clean_name(akbank_names[0])
-        receiver = clean_name(akbank_names[1])
-    elif len(akbank_names) == 1:
-        sender = clean_name(akbank_names[0])
-
-    if sender == "Belirsiz":
-        m = re.search(r'Vergi Dairesi.*?\n.*?\n([A-ZÇĞİÖŞÜ\s.]{5,40})\n', text_clean, re.IGNORECASE | re.DOTALL)
-        if m:
-            sender = clean_name(m.group(1))
-
-    tckn_match = re.search(r'\b([1-9][0-9]{10})\b', text_clean)
-    tckn = tckn_match.group(1) if tckn_match else ""
-
-    return {
-        "is_demand_only": is_demand,
-        "sender_bank": "",
-        "receiver_bank": "",
-        "sender_name": sender,
-        "receiver_name": receiver,
-        "receiver_iban": rec_iban,
-        "amount": amount,
-        "sorgu_no": sorgu,
-        "date_str": "",
-        "tckn": tckn
-    }
 
 def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[bool, str]:
     stmt_info["processed_count"] = stmt_info.get("processed_count", 0) + 1
@@ -231,28 +149,29 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
     stmt_raw = stmt_info["raw_text"].upper()
     stmt_lines = stmt_info.get("lines", [])
     stmt_iban = stmt_info["iban"]
+    used_lines = stmt_info.setdefault("used_lines", set())
     
-    rec_iban = dekont.get("receiver_iban", "")
-
     found = False
     proof = ""
     reason = ""
 
     sorgu = str(dekont.get("sorgu_no", "")).strip().upper()
     if sorgu and len(sorgu) >= 5 and sorgu in stmt_raw:
-        found = True
-        reason = f"Ref/Sorgu No ({sorgu})"
-        for l in stmt_lines:
-            if sorgu in l.upper():
+        for i, l in enumerate(stmt_lines):
+            if sorgu in l.upper() and i not in used_lines:
+                found = True
+                reason = f"Ref/Sorgu No ({sorgu})"
                 proof = l
+                used_lines.add(i)
                 break
 
     if not found and dekont.get("tckn") and len(dekont["tckn"]) == 11 and dekont["tckn"] in stmt_raw:
-        found = True
-        reason = f"TCKN ({dekont['tckn']})"
-        for l in stmt_lines:
-            if dekont["tckn"] in l:
+        for i, l in enumerate(stmt_lines):
+            if dekont["tckn"] in l and i not in used_lines:
+                found = True
+                reason = f"TCKN ({dekont['tckn']})"
                 proof = l
+                used_lines.add(i)
                 break
 
     if not found:
@@ -274,7 +193,9 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
         amt_fmt2 = f"{amt_val:.2f}"
         amt_fmt3 = f"{int(amt_val)}"
 
-        for l in stmt_lines:
+        for i, l in enumerate(stmt_lines):
+            if i in used_lines:
+                continue
             l_norm = normalize_text(l)
             l_ns = l.replace(" ", "")
             if sender_norm and len(sender_norm) > 3 and sender_norm.split()[-1] in l_norm:
@@ -282,10 +203,13 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
                     found = True
                     reason = "İsim + Tutar Eşleşti"
                     proof = l
+                    used_lines.add(i)
                     break
 
         if not found and amt_val >= 10.0:
-            for l in stmt_lines:
+            for i, l in enumerate(stmt_lines):
+                if i in used_lines:
+                    continue
                 l_up = l.upper()
                 l_ns = l.replace(" ", "")
                 is_inflow = any(k in l_up for k in ["ALACAK", "GELEN", "FAST", "EFT", "HAVALE", "+"]) and "BORÇ" not in l_up and "BORC" not in l_up
@@ -293,6 +217,7 @@ def match_dekont(dekont: Dict[str, Any], stmt_info: Dict[str, Any]) -> Tuple[boo
                     found = True
                     reason = f"Tutar Para Girişi ({amount_str} TL)"
                     proof = l
+                    used_lines.add(i)
                     break
 
     if found:
@@ -491,12 +416,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if len(text.strip()) > 60:
-            dekont_data = parse_digital_pdf_dekont(text)
-        else:
-            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-            pix = pdf_doc[0].get_pixmap(dpi=150)
-            dekont_data = await parse_image_with_gemini(pix.tobytes("jpeg"))
+        pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+        pix = pdf_doc[0].get_pixmap(dpi=150)
+        dekont_data = await parse_image_with_gemini(pix.tobytes("jpeg"))
     else:
         if chat_id not in chat_statements:
             await update.message.reply_text(
