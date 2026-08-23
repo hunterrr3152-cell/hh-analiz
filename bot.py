@@ -398,22 +398,40 @@ Sadece JSON dön:
             
         try:
             if api_node["type"] == "gemini":
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        api_node["client"].models.generate_content,
-                        model='gemini-3.7-flash',
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                            prompt
-                        ],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=schema,
-                            temperature=0.0
+                gemini_models = [
+                    "gemini-3.7-flash",
+                    "gemini-3.6-flash",
+                    "gemini-3.5-flash",
+                    "gemini-3-flash"
+                ]
+                
+                success = False
+                for m_name in gemini_models:
+                    try:
+                        response = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                api_node["client"].models.generate_content,
+                                model=m_name,
+                                contents=[
+                                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                                    prompt
+                                ],
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    response_schema=schema,
+                                    temperature=0.0
+                                )
+                            ),
+                            timeout=20.0
                         )
-                    ),
-                    timeout=30.0
-                )
+                        success = True
+                        break
+                    except Exception:
+                        continue
+                        
+                if not success:
+                    raise Exception("Tüm Gemini modelleri (3.7'den 3'e kadar) reddetti veya limit doldu.")
+                    
                 try:
                     dekont_info = json.loads(response.text)
                 except Exception:
