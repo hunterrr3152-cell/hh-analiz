@@ -62,7 +62,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 def compress_image_for_ai(image_bytes: bytes) -> bytes:
     try:
         pix = fitz.Pixmap(image_bytes)
-        max_dim = 960.0
+        max_dim = 512.0
         scale = 1.0
         if max(pix.w, pix.h) > max_dim:
             scale = max_dim / max(pix.w, pix.h)
@@ -72,7 +72,11 @@ def compress_image_for_ai(image_bytes: bytes) -> bytes:
         rect = fitz.Rect(0, 0, pix.w * scale, pix.h * scale)
         page.insert_image(rect, stream=image_bytes)
         out_pix = page.get_pixmap(dpi=72)
-        return out_pix.tobytes("jpeg", 80) # 80 quality for extra token saving
+        
+        # Convert to Grayscale
+        gray_pix = fitz.Pixmap(fitz.csGRAY, out_pix)
+        
+        return gray_pix.tobytes("jpeg", 80)
     except Exception:
         return image_bytes
 
@@ -351,6 +355,8 @@ Kurallar:
 2. Alıcı IBAN Kontrolü: Dekonttaki alıcı IBAN (veya maskeli hali, örn: TR12****34) ile üstteki Ekstre Sahibinin IBAN'ı açıkça uyuşmuyorsa is_iban_matched = false dön. Dekontta IBAN yoksa, gizliyse ve çelişmiyorsa veya sadece kolay adres varsa true dön.
 3. Tutar Kontrolü: Dekontta "İşlem Tutarı" ve "Masraf/Ücret" ayrı ayrı belirtilmişse (veya "Toplam Tutar" masrafla birlikte daha yüksekse), KESİNLİKLE sadece net transfer edilen "İşlem Tutarı"nı (Hesaba geçen/gönderilen saf parayı) baz al. Masraf eklenmiş "Toplam Tutar"ı çıkarma!
 
+ÇOK ÖNEMLİ KURAL: Hiçbir açıklama, selamlama, düşünme süreci veya ekstra metin YAZMA. Sadece ve sadece süslü parantez ile başlayan ham JSON formatını dön!
+
 Sadece JSON dön:
 {{
   "sender_name": "Gönderen Adı Soyadı",
@@ -403,7 +409,8 @@ Sadece JSON dön:
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             response_schema=schema,
-                            temperature=0.0
+                            temperature=0.0,
+                            max_output_tokens=150
                         )
                     ),
                     timeout=30.0
@@ -431,7 +438,8 @@ Sadece JSON dön:
                             ]
                         }
                     ],
-                    "temperature": 0.0
+                    "temperature": 0.0,
+                    "max_tokens": 150
                 }
                 async with httpx.AsyncClient(verify=False) as client:
                     resp = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30.0)
