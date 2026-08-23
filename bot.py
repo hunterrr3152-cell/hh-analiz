@@ -205,18 +205,21 @@ Lütfen JSON dön:
             
         try:
             if api_node["type"] == "gemini":
-                response = await asyncio.to_thread(
-                    api_node["client"].models.generate_content,
-                    model='gemini-3.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=schema,
-                        temperature=0.0
-                    )
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        api_node["client"].models.generate_content,
+                        model='gemini-3.5-flash',
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                            prompt
+                        ],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=schema,
+                            temperature=0.0
+                        )
+                    ),
+                    timeout=60.0
                 )
                 try:
                     dekont_info = json.loads(response.text)
@@ -287,8 +290,11 @@ Lütfen JSON dön:
 
 async def analyze_worker(file_bytes: bytes, chat_id: int, sem: asyncio.Semaphore) -> Tuple[bool, str, bytes]:
     async with sem:
-        is_matched, res_text = await process_dekont_with_ai(file_bytes, chat_id)
-        return is_matched, res_text, file_bytes
+        try:
+            is_matched, res_text = await process_dekont_with_ai(file_bytes, chat_id)
+            return is_matched, res_text, file_bytes
+        except Exception as e:
+            return False, f"❌ Sistem Hatası (Çökme): {str(e)}", file_bytes
 
 async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id: int):
     st = chat_statements.get(chat_id)
@@ -300,7 +306,7 @@ async def run_analysis(chat_id: int, context: ContextTypes.DEFAULT_TYPE, msg_id:
     if total == 0:
         return
         
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(len(API_POOL) if API_POOL else 1)
     tasks = [asyncio.create_task(analyze_worker(f, chat_id, sem)) for f in dekonts_to_process]
     
     last_update = time.time()
